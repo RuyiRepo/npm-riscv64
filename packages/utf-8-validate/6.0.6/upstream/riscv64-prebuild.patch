@@ -1,0 +1,70 @@
+Upstream-PR: ci: build a linux-riscv64 prebuild and ship it in the release tarballs
+Upstream-Repo: https://github.com/websockets/utf-8-validate
+Upstream-Base: v6.0.6 (e8f7d2f)
+Upstream-Files: .github/workflows/ci.yml
+
+Why: utf-8-validate publishes prebuilds for six platforms and none for linux-riscv64, so every
+riscv64 consumer compiles the addon on install. The addon is plain C with no
+architecture assumptions, so one more prebuild row closes that gap.
+
+What changes: a build-riscv64 job that runs upstream's own `npm run prebuild` on a
+riscv64 runner - prebuildify names the output after the host architecture, so
+emulation would not produce the expected directory - and one extra tar line in the
+release job, so the artifact ships next to the other six.
+
+How it was tested: this addon was built and tested on riscv64 (upstream's own mocha
+suite, then the prebuild loaded with node_modules/build removed), and the resulting
+file is a RISC-V ELF named prebuilds/linux-riscv64/utf-8-validate.node, which is exactly what
+node-gyp-build resolves there.
+
+Note: this patch is NOT applied by the composite action in this repository (see
+.dsh/plan.md D34). It is kept here so the increment can be submitted upstream as is.
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 5ba9841..3aef54b 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -79,8 +79,32 @@ jobs:
+           name: ${{ matrix.os }}-${{ matrix.arch }}
+           path: prebuilds
+           retention-days: 1
++  build-riscv64:
++    if: startsWith(github.ref, 'refs/tags/')
++    needs: test
++    # GitHub has no hosted riscv64 runner, and prebuildify names the directory after
++    # the host's own architecture, so this has to run on a real riscv64 machine
++    # rather than under emulation. Relabel the runner if yours is named differently.
++    #
++    # The musl step is x64-only on purpose: the riscv64 toolchain here is glibc, and
++    # prebuildify-cross would need an alpine image that node does not ship for it.
++    runs-on: [self-hosted, linux, riscv64]
++    steps:
++      - uses: actions/checkout@v6
++      - uses: actions/setup-node@v6
++        with:
++          node-version: 20
++      - run: npm install
++      - run: npm run prebuild
++      - uses: actions/upload-artifact@v5
++        with:
++          name: ubuntu-22.04-riscv64
++          path: prebuilds
++          retention-days: 1
+   release:
+-    needs: build
++    needs:
++      - build
++      - build-riscv64
+     permissions:
+       contents: write # Needed for softprops/action-gh-release.
+     runs-on: ubuntu-latest
+@@ -100,6 +124,9 @@ jobs:
+       - run:
+           tar -cvf "${{ steps.get_version.outputs.version }}-linux-x64.tar" -C
+           "prebuilds/ubuntu-22.04-x64" linux-x64
++      - run:
++          tar -cvf "${{ steps.get_version.outputs.version }}-linux-riscv64.tar" -C
++          "prebuilds/ubuntu-22.04-riscv64" linux-riscv64
+       - run:
+           tar -cvf "${{ steps.get_version.outputs.version }}-win32-ia32.tar" -C
+           "prebuilds/windows-latest-x86" win32-ia32

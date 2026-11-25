@@ -1,0 +1,20 @@
+set -euo pipefail
+
+# Install the JS side without running upstream lifecycle scripts: node-gyp-build
+# would only look for a prebuilt binary, and we want a from-source build.
+npm install --ignore-scripts --no-audit --no-fund
+
+# node-gyp is provided by the toolchain image; fall back to npm for images that
+# only ship the bundled npm copy.
+if ! command -v node-gyp >/dev/null 2>&1; then
+  npm install -g node-gyp --no-audit --no-fund
+fi
+
+node-gyp rebuild
+
+# Stage the freshly built addon where node-gyp-build looks for it on riscv64.
+mkdir -p prebuilds/linux-riscv64
+cp build/Release/bufferutil.node prebuilds/linux-riscv64/bufferutil.node
+
+ls -l prebuilds/linux-riscv64/
+file prebuilds/linux-riscv64/bufferutil.node

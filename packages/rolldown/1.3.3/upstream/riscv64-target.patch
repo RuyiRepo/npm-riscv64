@@ -1,0 +1,59 @@
+Upstream-PR: build and publish a riscv64 binding
+Upstream-Repo: https://github.com/rolldown/rolldown
+Upstream-Base: v1.3.3 (8a576d2f)
+Upstream-Files: packages/rolldown/package.json, .github/workflows/reusable-release-build.yml
+
+Why: rolldown has no riscv64 binding. The loader in packages/rolldown/src/binding.cjs
+already knows how to load one (it probes @rolldown/binding-linux-riscv64-gnu before
+falling back), so the only thing missing is a build that produces it.
+
+What: the target joins napi.targets, which makes napi pre-publish emit
+@rolldown/binding-linux-riscv64-gnu next to the other 16 platform packages and add
+it to the wrapper's optionalDependencies. The release workflow gains one matrix
+entry, built natively on a self-hosted riscv64 runner: GitHub hosts no riscv64
+runner, and cross-building this workspace under emulation costs more than the build
+itself. The runs-on line becomes sequential so every other entry keeps its hosted
+runner unchanged.
+
+Note: no source change is needed, and no other architecture starts being built
+differently - the increment is one target, one matrix row, one runs-on fallback.
+
+diff --git a/.github/workflows/reusable-release-build.yml b/.github/workflows/reusable-release-build.yml
+index f4e60697..859d02a9 100644
+--- a/.github/workflows/reusable-release-build.yml
++++ b/.github/workflows/reusable-release-build.yml
+@@ -76,13 +76,21 @@ jobs:
+             target: powerpc64le-unknown-linux-gnu
+             build: vp run ci:build-release-binding --target powerpc64le-unknown-linux-gnu --use-napi-cross
+ 
++          # riscv64 is built on a native runner: GitHub hosts none, and a cross
++          # build of this workspace under emulation is slower than the build itself.
++          - os: ubuntu-latest
++            runs-on: [self-hosted, linux, riscv64]
++            target: riscv64gc-unknown-linux-gnu
++            build: vp run ci:build-release-binding --target riscv64gc-unknown-linux-gnu
++
+           - os: ubuntu-latest
+             target: wasm32-wasip1-threads
+             build: |
+               vp run --filter rolldown build-binding:wasi:release
+ 
+     name: Build ${{ matrix.target }}
+-    runs-on: ${{ matrix.os }}
++    # Sequential runs-on: an entry overrides the hosted runner it would default to.
++    runs-on: ${{ matrix['runs-on'] || matrix.os }}
+     steps:
+       - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+ 
+diff --git a/packages/rolldown/package.json b/packages/rolldown/package.json
+index 4e45c421..7ec96cdb 100644
+--- a/packages/rolldown/package.json
++++ b/packages/rolldown/package.json
+@@ -173,6 +173,7 @@
+       "armv7-linux-androideabi",
+       "armv7-unknown-linux-gnueabihf",
+       "powerpc64le-unknown-linux-gnu",
++    "riscv64gc-unknown-linux-gnu",
+       "s390x-unknown-linux-gnu",
+       "wasm32-wasip1-threads",
+       "x86_64-apple-darwin",

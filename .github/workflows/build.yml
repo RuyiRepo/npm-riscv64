@@ -1,0 +1,281 @@
+name: build riscv64 packages
+
+# One workflow file, two triggers (see .dsh/plan.md D5/D17):
+#   * pull_request -> fetch, patch, build, test
+#   * push to main -> the same, plus publish
+# Publishing never happens for pull requests: the merge is the approval gate.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  # Manual lever: publish the cached trees again without building anything. Needed
+  # when the delivery side changed and the recipes did not - or when a registry
+  # rejected what an earlier run pushed.
+  workflow_dispatch:
+    inputs:
+      republish:
+        description: "Publish every recipe from the cached build tree (no rebuild)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read    # find and download a previous build tree (artifact reuse)
+  # Publishing uses the registry credential in secrets.NPM_PUBLISH_TOKEN, not the
+  # workflow token. `packages: write` stays for forks that publish to GitHub
+  # Packages itself (PUBLISH_REGISTRY + PUBLISH_SCOPE == owner).
+  packages: write
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect:
+    name: detect changed recipes
+    # Self-hosted runners are addressed by one label (repository variable
+    # RISCV_RUNNER=riscv64-builder); unset keeps the hosted images.
+    runs-on: ${{ vars.RISCV_RUNNER || 'ubuntu-latest' }}
+    outputs:
+      targets: ${{ steps.detect.outputs.targets }}
+      has_targets: ${{ steps.detect.outputs.has_targets }}
+      self_check: ${{ steps.detect.outputs.self_check }}
+      publish: ${{ steps.detect.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed recipes
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          REPUBLISH: ${{ inputs.republish || 'false' }}
+        run: python3 scripts/detect_targets.py
+
+      - name: Render self-check
+        if: steps.detect.outputs.self_check == 'true'
+        run: python3 scripts/render.py --check-all
+
+  build:
+    name: build (${{ matrix.target.slug }})
+    needs: detect
+    if: needs.detect.outputs.has_targets == 'true'
+    # Self-hosted runners are addressed by one label (repository variable
+    # RISCV_RUNNER=riscv64-builder); unset keeps the hosted images.
+    runs-on: ${{ vars.RISCV_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target: ${{ fromJSON(needs.detect.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare riscv64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      # The toolchain image is built once by toolchain-image.yml and pulled here:
+      # building it in every matrix job costs minutes of emulated apt installs and
+      # can silently produce nothing (buildx keeps the result in its cache unless
+      # the build is pushed or loaded).
+      # The recipe chooses its toolchain (native or cross). A cross recipe builds in
+      # the amd64 image and tests in the riscv64 one, so both have to be resolved
+      # and pulled here; the action reads them as RISCV_IMAGE / RISCV_TEST_IMAGE.
+      - name: Resolve toolchain image
+        env:
+          IMAGE_OVERRIDE: ${{ vars.RISCV_IMAGE }}
+          CROSS_OVERRIDE: ${{ vars.RISCV_CROSS_IMAGE }}
+          TOOLCHAIN: ${{ matrix.target.toolchain }}
+        run: |
+          set -euo pipefail
+          # GHCR rejects uppercase repository names, so lowercase the owner.
+          owner_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/npm-riscv64-toolchain"
+          native_image="${IMAGE_OVERRIDE:-$owner_image:riscv64}"
+          if [ -n "${CROSS_OVERRIDE:-}" ]; then
+            cross_image="$CROSS_OVERRIDE"
+          elif [ -n "${IMAGE_OVERRIDE:-}" ]; then
+            # Follow a custom registry by swapping the tag of the native image.
+            cross_image="${IMAGE_OVERRIDE%:*}:cross"
+          else
+            cross_image="$owner_image:cross"
+          fi
+          if [ "${TOOLCHAIN:-native}" = "cross" ]; then
+            echo "RISCV_IMAGE=$cross_image" >> "$GITHUB_ENV"
+            echo "RISCV_TEST_IMAGE=$native_image" >> "$GITHUB_ENV"
+            echo "RISCV_IMAGE_PLATFORM=linux/amd64" >> "$GITHUB_ENV"
+            echo "RISCV_TEST_IMAGE_PLATFORM=linux/riscv64" >> "$GITHUB_ENV"
+            echo "toolchain: cross (build $cross_image, test $native_image)"
+          else
+            echo "RISCV_IMAGE=$native_image" >> "$GITHUB_ENV"
+            echo "RISCV_IMAGE_PLATFORM=linux/riscv64" >> "$GITHUB_ENV"
+            echo "toolchain: native ($native_image)"
+          fi
+
+      # Only authenticate when a token is actually supplied. Docker never falls
+      # back to anonymous once credentials exist for a registry, and the
+      # GITHUB_TOKEN of a fork cannot read a package that was pushed from a laptop
+      # into the owner's namespace - that combination turns a public image into
+      # "403 Forbidden".
+      - name: Log in to the container registry (only with a token)
+        if: startsWith(vars.RISCV_IMAGE || 'ghcr.io/', 'ghcr.io/')
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_TOKEN:-}" ]; then
+            echo "no GHCR_TOKEN secret set: pulling anonymously (public images work)"
+            exit 0
+          fi
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull toolchain images
+        run: |
+          set -euo pipefail
+          # The images are published per platform (riscv64 for native builds, amd64
+          # for the cross toolchain), so a pull must name the platform it wants:
+          # without it the daemon asks for the runner platform and the registry
+          # answers "no matching manifest for linux/amd64 in the manifest list
+          # entries" for a riscv64-only image.
+          pull_image() {
+            local image="$1" platform="$2"
+            [ -n "$image" ] || return 0
+            echo "pulling $image ($platform)"
+            if ! docker pull --platform "$platform" "$image"; then
+              echo "ERROR: cannot pull $image ($platform)" >&2
+              echo "  public package  -> anonymous pull should work; check the tag exists" >&2
+              echo "  private package -> connect the package to this repository, or add a" >&2
+              echo "                     token with read:packages as the GHCR_TOKEN secret" >&2
+              exit 1
+            fi
+            docker image inspect "$image" --format "image id: $image {{.Id}}"
+          }
+          pull_image "$RISCV_IMAGE" "${RISCV_IMAGE_PLATFORM:-linux/riscv64}"
+          pull_image "${RISCV_TEST_IMAGE:-}" "${RISCV_TEST_IMAGE_PLATFORM:-linux/riscv64}"
+
+      # Artifact reuse (D16). The key covers every input that can change the built
+      # artifact - recipe, common layer, template, renderer, toolchain, image - so a
+      # hit cannot be stale by construction. The plan originally described locating
+      # the merge's pull request run; content addressing is stricter and also covers
+      # direct pushes and re-runs, so it replaces that lookup chain.
+      - name: Compute build key
+        id: cache
+        run: |
+          set -euo pipefail
+          key=$(python3 scripts/build_key.py \
+            --pkg "${{ matrix.target.pkg }}" \
+            --ver "${{ matrix.target.ver }}" \
+            --image-id "$(docker image inspect "$RISCV_IMAGE" --format '{{.Id}}')")
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "name=${{ matrix.target.artifact }}-tree-$key" >> "$GITHUB_OUTPUT"
+          echo "build key: $key (artifact ${{ matrix.target.artifact }}-tree-$key)"
+
+      # Never fails the job: no cache is always a valid answer.
+      - name: Restore cached build tree
+        id: reuse
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT: ${{ steps.cache.outputs.name }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .workflow_run.id' | head -1)
+          if [ -z "$run_id" ]; then
+            echo "miss: nothing cached as $ARTIFACT"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh run download "$run_id" -n "$ARTIFACT" -D .cache
+          tarball=$(find .cache -name '*.tar.gz' | head -1)
+          mkdir -p src
+          # --no-same-owner: the tree must belong to the runner, whoever packed it.
+          tar xzf "$tarball" -C src --no-same-owner
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          echo "hit: restored $ARTIFACT from run $run_id ($(du -sh src | cut -f1))"
+
+      # The rendered action goes to a fixed path: every matrix job has its own
+      # workspace, and `uses:` does not accept expressions.
+      #
+      # PUBLISH_SCOPE / PUBLISH_REGISTRY are optional repository variables, for
+      # pointing a build at a different registry or scope than the recipe names
+      # (a GitHub Packages target needs PUBLISH_SCOPE == the repository owner).
+      # The recipes themselves stay unchanged.
+      - name: Render composite action
+        env:
+          PUBLISH_SCOPE: ${{ vars.PUBLISH_SCOPE }}
+          PUBLISH_REGISTRY: ${{ vars.PUBLISH_REGISTRY }}
+        run: |
+          set -euo pipefail
+          args=(
+            --pkg "${{ matrix.target.pkg }}"
+            --ver "${{ matrix.target.ver }}"
+            --out-dir .rendered/action
+          )
+          if [ -n "${PUBLISH_SCOPE:-}" ]; then
+            echo "rewriting publish scope to @$PUBLISH_SCOPE"
+            args+=(--publish-scope "$PUBLISH_SCOPE")
+          fi
+          if [ -n "${PUBLISH_REGISTRY:-}" ]; then
+            echo "rewriting publish registry to $PUBLISH_REGISTRY"
+            args+=(--publish-registry "$PUBLISH_REGISTRY")
+          fi
+          python3 scripts/render.py "${args[@]}"
+
+      - name: Run composite action
+        uses: ./.rendered/action
+        with:
+          # Publishing is gated three times: the workflow decides (main only), the
+          # repository variable can veto it, and the action only publishes when the
+          # input says so.
+          publish: ${{ needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true' }}
+          reuse: ${{ steps.reuse.outputs.hit == 'true' }}
+          # A "publish" target means only the delivery changed: the cached tree is
+          # restored above and nothing is fetched, built or tested again.
+          publish_only: ${{ matrix.target.mode == 'publish' }}
+        env:
+          # The recipes read NODE_AUTH_TOKEN (npm's canonical variable) and say how
+          # to use it, so the secret only has to hold the credential. The test
+          # registry answers `WWW-Authenticate: Basic`, hence recipes set
+          # `auth: basic` and this value is base64 of "user:password". A recipe
+          # publishing to GitHub Packages reads it as a token instead.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.artifact }}
+          path: src/${{ matrix.target.artifact_glob }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # The tree is the cache unit, not just the artifact: publish needs the source
+      # tree as well, and the test step needs node_modules to resolve the prebuild
+      # the way a consumer would. .git is the only thing left out.
+      - name: Pack build tree
+        if: steps.reuse.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          # Cargo's target/ is pure build scratch: on a cache hit the build is skipped
+          # and no later step reads it, while for a Rust workspace it can be several
+          # hundred megabytes of intermediates. The artifact itself is uploaded
+          # separately, above.
+          tar czf "${{ steps.cache.outputs.name }}.tar.gz" -C src \
+            --exclude=.git --exclude=./target .
+          ls -lh "${{ steps.cache.outputs.name }}.tar.gz"
+
+      - name: Upload build tree
+        if: steps.reuse.outputs.hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.cache.outputs.name }}
+          path: ${{ steps.cache.outputs.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 90

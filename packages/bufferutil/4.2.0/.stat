@@ -1,0 +1,60 @@
+# Metadata for bufferutil 4.2.0 (see docs/recipe-spec.md).
+#
+# The path is packages/<npm name>/<version>: a recipe is identified by the package
+# it builds, not by the registry it publishes to. bufferutil is unscoped upstream
+# and stays unscoped here, so a consumer that points npm at a registry carrying
+# this recipe installs it with the very same `npm i bufferutil` it always used.
+#
+# bufferutil ships a single package that carries per-platform prebuilds
+# (prebuilds/<platform>-<arch>/bufferutil.node, loaded by node-gyp-build), so
+# there is no separate native binding package here: one publish target is
+# enough.
+#
+# What gets published is upstream's own tarball plus one directory: the riscv64
+# prebuild this recipe builds. Upstream's six platform prebuilds stay exactly as
+# they are, so every consumer - riscv64 or not - installs upstream's package layout
+# and riscv64 is just one more platform in it (.dsh/plan.md D33).
+
+upstream:
+  repo: https://github.com/websockets/bufferutil
+  ref: v4.2.0
+
+artifacts:
+  path: prebuilds/linux-riscv64/*.node
+
+npm_publish:
+  - role: main
+    name: bufferutil
+    version: 4.2.0
+    dir: .
+    # Trailing slash matters: npm derives its credential key from the URL as a
+    # directory (new URL('.', url)), so without it npm looks one segment up
+    # (//host/repository/) and the auth line below never matches.
+    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
+    token_env: NODE_AUTH_TOKEN
+    # This registry answers 401 with `WWW-Authenticate: Basic`, so the credential is
+    # the base64 of "user:password" (or "user:api-token"), not an npm bearer token.
+    auth: basic
+    # The package to publish is the upstream tarball, pinned by integrity. It is the
+    # only thing that makes the published package verifiable: without it, "upstream
+    # plus one directory" would be a promise nobody can check.
+    base:
+      kind: upstream-tarball
+      url: https://registry.npmjs.org/bufferutil/-/bufferutil-4.2.0.tgz
+      integrity: sha512-gyy58jET9kst2IGyBKb96a4Y2bPGTHXGyCd0/1eqIV3hr1Sz3VxtA8n7bXh8fLIuE2K6Z0Upax5a5Msx+HU1IQ==
+    # Upstream's manifest is published as it is; only publishConfig.registry follows
+    # this recipe. Name, version, main, install and engines stay upstream's.
+    manifest_shape: upstream
+    # The riscv64 increment: staged by commands/build, copied into the upstream
+    # package by the publish step (the whole directory, so nothing else may be in it).
+    overlay:
+      - prebuilds/linux-riscv64
+
+# The upstream increment: what a PR adding riscv64 to upstream would change. It is
+# never applied here (patches/ is for build-time patches, upstream/ is not), and
+# scripts/check_patches.py holds it to that.
+upstream_increments:
+  - patch: upstream/riscv64-prebuild.patch
+    touches:
+      - .github/workflows/ci.yml
+    pr: "build a linux-riscv64 prebuild and ship it in the release tarballs"

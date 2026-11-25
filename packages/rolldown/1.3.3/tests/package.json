@@ -1,0 +1,9 @@
+{
+  "name": "rolldown-riscv64-tests",
+  "private": true,
+  "type": "module",
+  "description": "Upstream's own JavaScript tests, run against the installed package on riscv64.",
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}

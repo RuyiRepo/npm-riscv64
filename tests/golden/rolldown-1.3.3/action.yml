@@ -1,0 +1,148 @@
+name: "build rolldown@1.3.3 (riscv64)"
+description: "Generated from packages/rolldown/1.3.3 by scripts/render.py - do not edit by hand."
+# The name uses the publish target, so a fork that rewrites the scope (PUBLISH_SCOPE)
+# shows the package it actually publishes.
+
+# Two toolchains are supported, chosen per recipe by `toolchain:` in .stat:
+#
+#   native (default) - fetch/patch/build/test all run inside a riscv64 container
+#     under qemu. Slower, but nothing is cross-compiled: the compiler itself runs
+#     on the target CPU.
+#   cross - fetch/patch/build run in an amd64 container carrying the riscv64 cross
+#     toolchain (rustc + riscv64-linux-gnu gcc), and only the test step runs in the
+#     riscv64 container, so the produced artifact is still exercised on its own CPU.
+#     For a large Rust workspace this is minutes instead of hours.
+#
+# Override the images at run time with RISCV_IMAGE (build) and RISCV_TEST_IMAGE
+# (test, defaults to RISCV_IMAGE). The images are pinned here on purpose: changing
+# this template changes every recipe (see .dsh/plan.md D7).
+#
+# Containers run as the calling user (RISCV_DOCKER_USER overrides it) and get a
+# workspace HOME. Running as root would leave root-owned files in the workspace,
+# and the publish step - which runs on the host, without emulation - could not
+# write the manifest it has to generate.
+
+inputs:
+  publish:
+    description: "Publish the built packages to their registries"
+    required: false
+    default: "false"
+  reuse:
+    description: "The workspace tree was restored from the build cache: skip fetch, patch and build"
+    required: false
+    default: "false"
+  publish_only:
+    description: "Only deliver: the tree comes from the cache, nothing is built or tested again"
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: prepare toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_IMAGE:-npm-riscv64/toolchain:cross}"
+        test_image="${RISCV_TEST_IMAGE:-${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}}"
+        echo "build image: $image (linux/amd64) via cross toolchain"
+        echo "test image: $test_image (linux/riscv64)"
+        # Each image exists for exactly one platform, so a pull has to name it:
+        # without --platform the daemon asks for the platform of the host, and the
+        # registry answers "no matching manifest for linux/amd64 in the manifest
+        # list entries" for a riscv64-only image.
+        pull_image() {
+          local platform="$1" one="$2"
+          if docker image inspect "$one" >/dev/null 2>&1; then
+            return 0
+          fi
+          echo "image not present locally, pulling $one ($platform)"
+          if ! docker pull --platform "$platform" "$one"; then
+            echo "ERROR: cannot pull $one ($platform)" >&2
+            echo "Set RISCV_IMAGE / RISCV_TEST_IMAGE to reachable images (see the" >&2
+            echo "toolchain-image workflow), or build them locally:" >&2
+            echo "  docker build -f docker/riscv64-cross.Dockerfile -t npm-riscv64/toolchain:cross ." >&2
+            return 1
+          fi
+        }
+        pull_image "linux/amd64" "$image"
+        pull_image "linux/riscv64" "$test_image"
+        mkdir -p "$GITHUB_WORKSPACE/.container-home"
+        docker run --rm --platform linux/amd64 "$image" uname -m
+        # A cross toolchain has to prove it can target riscv64 before anything else
+        # runs; the produced binary is checked again in the test step.
+        docker run --rm --platform linux/amd64 "$image" \
+          sh -c 'rustc -V; riscv64-linux-gnu-gcc --version | head -1'
+
+    # A cache hit means the same inputs already produced this tree, so the three
+    # steps that create it are skipped. The test step still runs: a restored
+    # artifact has to be validated like a fresh one (D16).
+    #
+    # 1/5 - fetch: upstream > source > npm, falling through only on failure.
+    - name: fetch upstream source
+      if: inputs.reuse != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_IMAGE:-npm-riscv64/toolchain:cross}"
+        docker run --rm --platform linux/amd64 \
+          --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+          -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
+          -v "$GITHUB_WORKSPACE:/w" -w /w \
+          -e SRC_DIR=src -e TMP_DIR=.fetch-tmp \
+          "$image" bash "/w/.rendered/action/steps/fetch.sh"
+
+    # 3/5 - build
+    - name: build
+      if: inputs.reuse != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_IMAGE:-npm-riscv64/toolchain:cross}"
+        docker run --rm --platform linux/amd64 \
+          --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+          -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
+          -v "$GITHUB_WORKSPACE:/w" -w "/w/src/" \
+          -e SRC_DIR=src \
+          -e RISCV_TARGET=riscv64gc-unknown-linux-gnu \
+          "$image" bash "/w/.rendered/action/steps/build.sh"
+
+    # 4/5 - test: runs on the target CPU even for a cross recipe, and also asserts
+    # the artifact really is a RISC-V object.
+    #
+    # RECIPE_DIR is the recipe inside the container, so a test step can read the
+    # recipe's own data files: the riscv64 skip list lives next to the recipe it
+    # belongs to (tests/riscv64-skip.txt), never in the test script.
+    - name: test
+      if: inputs.publish_only != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_TEST_IMAGE:-${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}}"
+        docker run --rm --platform linux/riscv64 \
+          --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+          -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
+          -v "$GITHUB_WORKSPACE:/w" -w "/w/src/" \
+          -e SRC_DIR=src -e RECIPE_DIR="/w/packages/rolldown/1.3.3" \
+          "$image" bash "/w/.rendered/action/steps/test.sh"
+
+    # 5/5 - publish: runs on the host, no emulation needed to move files and
+    # talk to a registry.
+    # Publish-only means "deliver the tree the cache holds". Without that tree there is
+    # nothing to deliver, and publishing a half-fetched workspace would ship the wrong
+    # package - so this combination fails before the publish step runs.
+    - name: require the cached tree for publish-only
+      if: inputs.publish == 'true' && inputs.publish_only == 'true' && inputs.reuse != 'true'
+      shell: bash
+      run: |
+        echo "ERROR: publish-only was requested, but no build tree was restored." >&2
+        echo "  Nothing would be published, or worse, a stale tree would be." >&2
+        echo "  Build that recipe again first, then re-publish." >&2
+        exit 1
+
+    - name: publish
+      if: inputs.publish == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        bash ".rendered/action/steps/publish.sh"

@@ -1,0 +1,47 @@
+# Metadata for utf-8-validate 6.0.6 (see docs/recipe-spec.md).
+#
+# Same shape as bufferutil: the path is the upstream npm name (unscoped), upstream
+# ships one package carrying per-platform prebuilds
+# (prebuilds/<platform>-<arch>/utf-8-validate.node, loaded by node-gyp-build), and
+# what gets published is upstream's tarball plus the riscv64 directory this recipe
+# builds (.dsh/plan.md D33).
+#
+# The addon is N-API (src/validation.cc ends with NAPI_MODULE), so one build serves
+# every supported Node version - no per-ABI prebuild variants are needed.
+#
+# Upstream also publishes a musl build for linux-x64. riscv64 is glibc here (the
+# toolchain image is glibc, and this recipe targets gnu only), so no .musl file is
+# published for our platform.
+
+upstream:
+  repo: https://github.com/websockets/utf-8-validate
+  ref: v6.0.6
+
+artifacts:
+  path: prebuilds/linux-riscv64/*.node
+
+npm_publish:
+  - role: main
+    name: utf-8-validate
+    version: 6.0.6
+    dir: .
+    # Trailing slash matters: npm derives its credential key from the URL as a
+    # directory (new URL('.', url)), so without it npm looks one segment up
+    # (//host/repository/) and the auth line below never matches.
+    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
+    token_env: NODE_AUTH_TOKEN
+    # Basic credentials: base64 of "user:password" (see bufferutil for why).
+    auth: basic
+    base:
+      kind: upstream-tarball
+      url: https://registry.npmjs.org/utf-8-validate/-/utf-8-validate-6.0.6.tgz
+      integrity: sha512-q3l3P9UtEEiAHcsgsqTgf9PPjctrDWoIXW3NpOHFdRDbLvu4DLIcxHangJ4RLrWkBcKjmcs/6NkerI8T/rE4LA==
+    manifest_shape: upstream
+    overlay:
+      - prebuilds/linux-riscv64
+
+upstream_increments:
+  - patch: upstream/riscv64-prebuild.patch
+    touches:
+      - .github/workflows/ci.yml
+    pr: "build a linux-riscv64 prebuild and ship it in the release tarballs"
