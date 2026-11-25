@@ -54,7 +54,7 @@ npm_publish:
     # Trailing slash matters: npm derives its credential key from the URL as a
     # directory (new URL('.', url)), so without it npm looks one segment up
     # (//host/repository/) and the auth line never matches.
-    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
+    registry: https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/
     token_env: NODE_AUTH_TOKEN
     # Basic credentials: base64 of "user:password" (see bufferutil for why).
     auth: basic
@@ -63,7 +63,7 @@ npm_publish:
     name: rolldown
     version: 1.3.3
     dir: out/rolldown
-    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
+    registry: https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/
     token_env: NODE_AUTH_TOKEN
     auth: basic
     # The wrapper manifest comes from the pinned upstream tarball; the publish step
