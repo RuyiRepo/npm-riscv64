@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Proves that the *published* utf-8-validate works on real riscv64 hardware.
+#
+# Same question as the bufferutil snippet asks (.dsh/plan.md D41), with this addon's
+# API: starting from the package a consumer installs out of the registry, does it
+# resolve its riscv64 prebuild, load, and answer the validator cases correctly on this
+# CPU - with no source tree and no build directory, which a consumer does not have.
+#
+# Inputs come from the generated wrapper (scripts/physical_template.sh):
+# PHYSICAL_CONSUMER holds the consumer project npm installed into. Facts and checks go
+# back through physical_fact / physical_check.
+set -euo pipefail
+
+consumer="${PHYSICAL_CONSUMER:?physical.sh sets PHYSICAL_CONSUMER}"
+pkg=utf-8-validate
+pkg_dir="$consumer/node_modules/$pkg"
+[ -d "$pkg_dir" ] || {
+  echo "ERROR: $pkg is not installed in $consumer" >&2
+  exit 13
+}
+
+cat >"$PHYSICAL_WORK/verify.js" <<'JS'
+const assert = require('node:assert');
+const path = require('node:path');
+
+const pkgDir = process.argv[2];
+const emit = (kind, ...fields) => process.stdout.write([kind, ...fields].join('\t') + '\n');
+
+// node-gyp-build resolves prebuilds/<platform>-<arch>/<name>.node; upstream also ships
+// a musl variant for linux-x64, and this recipe ships glibc only, so the resolved name
+// must be the plain one.
+// node-gyp-build is the package's own dependency, and npm may hoist it next to
+// the installed package: resolver paths are anchored on the package directory, not
+// on this script, which lives in the wrapper's temporary directory.
+const gypBuild = require(require.resolve('node-gyp-build', { paths: [pkgDir] }));
+const resolved = gypBuild.path(pkgDir);
+emit('fact', 'binding', resolved);
+assert.ok(
+  resolved.endsWith('prebuilds/linux-riscv64/utf-8-validate.node'),
+  `node-gyp-build picked ${resolved}, expected prebuilds/linux-riscv64/utf-8-validate.node`
+);
+emit('check', 'resolved', 'ok', resolved);
+
+// Requiring the resolved path loads the N-API addon on this CPU; the module exports
+// the validator itself.
+const isValidUTF8 = require(resolved);
+assert.strictEqual(typeof isValidUTF8, 'function', 'the addon must export isValidUTF8');
+emit('check', 'loaded', 'ok', 'isValidUTF8 is callable');
+
+assert.strictEqual(isValidUTF8(Buffer.alloc(0)), true, 'empty buffer is valid UTF-8');
+assert.strictEqual(isValidUTF8(Buffer.from('ruyi-riscv64-utf8')), true, 'ASCII is valid');
+assert.strictEqual(
+  isValidUTF8(Buffer.from([0xf0, 0x90, 0x80, 0x80])),
+  true,
+  'a 4-byte sequence (U+10000) is valid'
+);
+assert.strictEqual(
+  isValidUTF8(Buffer.from([0xed, 0xa0, 0x80])),
+  false,
+  'a lone surrogate must be rejected'
+);
+assert.strictEqual(isValidUTF8(Buffer.from([0xc3])), false, 'a truncated sequence must be rejected');
+emit('check', 'validator', 'ok', '5 cases (3 valid, 2 rejected)');
+JS
+
+out="$PHYSICAL_WORK/verify.out"
+err="$PHYSICAL_WORK/verify.err"
+rc=0
+node "$PHYSICAL_WORK/verify.js" "$pkg_dir" >"$out" 2>"$err" || rc=$?
+
+binding=""
+while IFS=$'\t' read -r kind a b c; do
+  case "$kind" in
+    fact)
+      physical_fact "$a" "$b"
+      if [ "$a" = "binding" ]; then
+        binding="$b"
+      fi
+      ;;
+    check) physical_check "$a" "$b" "$c" ;;
+  esac
+done <"$out"
+
+if [ "$rc" -ne 0 ]; then
+  sed -e 's/^/  /' "$err" >&2
+  echo "ERROR: $pkg does not run on this hardware" >&2
+  exit 14
+fi
+
+if [ -z "$binding" ]; then
+  echo "ERROR: the binding path was not reported" >&2
+  exit 14
+fi
+physical_elf "$binding" || exit 14

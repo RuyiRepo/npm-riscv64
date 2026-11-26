@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Proves that the *published* bufferutil works on real riscv64 hardware.
+#
+# The emulated test step already runs upstream's suite against the built tree inside
+# the riscv64 image. This step asks a different question (.dsh/plan.md D41): starting
+# from the package a consumer installs out of the registry, does the addon load and
+# round-trip bytes on this CPU - not under qemu, without a source tree, and without
+# the build directory a consumer never has.
+#
+# Inputs come from the generated wrapper (scripts/physical_template.sh): PHYSICAL_CONSUMER
+# holds the consumer project npm installed into. Facts and checks are reported back
+# through physical_fact / physical_check, so this file never writes JSON.
+set -euo pipefail
+
+consumer="${PHYSICAL_CONSUMER:?physical.sh sets PHYSICAL_CONSUMER}"
+pkg=bufferutil
+pkg_dir="$consumer/node_modules/$pkg"
+[ -d "$pkg_dir" ] || {
+  echo "ERROR: $pkg is not installed in $consumer" >&2
+  exit 13
+}
+
+cat >"$PHYSICAL_WORK/verify.js" <<'JS'
+const assert = require('node:assert');
+const path = require('node:path');
+
+const pkgDir = process.argv[2];
+const emit = (kind, ...fields) => process.stdout.write([kind, ...fields].join('\t') + '\n');
+
+// Resolution happens the way a consumer's runtime does it: node-gyp-build looks for
+// prebuilds/<platform>-<arch>/<name>.node and only compiles when it finds none. There
+// is no build/ here, so a riscv64 prebuild in the published package is the only way
+// this can succeed.
+// node-gyp-build is the package's own dependency, and npm may hoist it next to
+// the installed package: resolver paths are anchored on the package directory, not
+// on this script, which lives in the wrapper's temporary directory.
+const gypBuild = require(require.resolve('node-gyp-build', { paths: [pkgDir] }));
+const resolved = gypBuild.path(pkgDir);
+emit('fact', 'binding', resolved);
+emit('fact', 'binding_rel', path.relative(path.join(pkgDir, '..', '..'), resolved));
+assert.ok(
+  resolved.includes('prebuilds/linux-riscv64'),
+  `node-gyp-build picked ${resolved}, expected the riscv64 prebuild`
+);
+emit('check', 'resolved', 'ok', resolved);
+
+// Loading it is the real proof: a wrong architecture fails here, on this CPU, with
+// whatever error the loader raises.
+const lib = require(resolved);
+assert.strictEqual(typeof lib.mask, 'function', 'the addon must export mask');
+assert.strictEqual(typeof lib.unmask, 'function', 'the addon must export unmask');
+emit('check', 'loaded', 'ok', 'mask/unmask are callable');
+
+const payload = Buffer.from('ruyi-riscv64-bufferutil');
+const key = Buffer.from('0123456789abcdef');
+const masked = Buffer.alloc(payload.length);
+lib.mask(payload, key, masked, 0, payload.length);
+assert.notDeepStrictEqual(masked, payload, 'mask must change the payload');
+lib.unmask(masked, key);
+assert.deepStrictEqual(masked, payload, 'unmask must restore the payload');
+emit('check', 'round-trip', 'ok', `${payload.length} bytes masked and restored`);
+JS
+
+out="$PHYSICAL_WORK/verify.out"
+err="$PHYSICAL_WORK/verify.err"
+rc=0
+node "$PHYSICAL_WORK/verify.js" "$pkg_dir" >"$out" 2>"$err" || rc=$?
+
+binding=""
+while IFS=$'\t' read -r kind a b c; do
+  case "$kind" in
+    fact)
+      physical_fact "$a" "$b"
+      if [ "$a" = "binding" ]; then
+        binding="$b"
+      fi
+      ;;
+    check) physical_check "$a" "$b" "$c" ;;
+  esac
+done <"$out"
+
+# The ELF check is separate from the load check: loading proves the loader accepted it
+# on this machine, the ELF proves what it is (and is what the report shows).
+if [ "$rc" -ne 0 ]; then
+  # The failing assertion is the useful message: print it before anything else.
+  sed -e 's/^/  /' "$err" >&2
+  echo "ERROR: $pkg does not run on this hardware" >&2
+  exit 14
+fi
+
+if [ -z "$binding" ]; then
+  echo "ERROR: the addon path was not reported" >&2
+  exit 14
+fi
+physical_elf "$binding" || exit 14
+
+if [ "$rc" -ne 0 ]; then
+  sed -e 's/^/  /' "$err" >&2
+  echo "ERROR: $pkg does not run on this hardware" >&2
+  exit 14
+fi

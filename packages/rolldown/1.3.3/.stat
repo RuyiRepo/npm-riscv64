@@ -73,6 +73,16 @@ npm_publish:
     optional_dependencies:
       - "@rolldown/binding-linux-riscv64-gnu"
 
+# Hardware verification (.dsh/plan.md D41): where a run on real riscv64 silicon
+# installs from. This is the *read* side and is deliberately separate from
+# npm_publish above - consumers point at a group repository that aggregates the
+# private one, and that group needs no credential while publishing does. Keeping the
+# two apart means a read credential is never inherited from the publish side.
+physical:
+  registry: https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-group
+  auth: none
+  source: registry
+
 # Upstream's increment, written as a pull request: the target joins napi.targets and
 # the release workflow gains a native riscv64 build row. Recorded here, never applied
 # by this recipe.

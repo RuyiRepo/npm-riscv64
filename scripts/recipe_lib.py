@@ -20,8 +20,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-SNIPPET_NAMES = ("fetch", "patch", "build", "test", "publish")
+SNIPPET_NAMES = ("fetch", "patch", "build", "test", "publish", "install", "verify")
 REQUIRED_SNIPPETS = ("build", "test")
+
+#: Recipes are rendered into two kinds of action, and each kind needs a different set
+#: of recipe-authored snippets. The build template renders the five steps of the
+#: pipeline; the physical template renders install (generated unless the recipe has
+#: its own) and verify (always recipe-authored, because what proves the artifact works
+#: on hardware differs per package).
+TEMPLATE_SNIPPETS = {
+    "action.template.yml": REQUIRED_SNIPPETS,
+    "physical.template.yml": ("verify",),
+}
+
+
+def required_snippets_for(template_name: str) -> tuple[str, ...]:
+    """Which recipe snippets a template needs. Unknown templates need the five steps."""
+    return TEMPLATE_SNIPPETS.get(template_name, REQUIRED_SNIPPETS)
 COMMON_DIR = "common"
 STAT_FILE = ".stat"
 DISABLE_FILE = ".disable"
@@ -72,6 +87,28 @@ PUBLISH_AUTH_TOKEN = "token"
 PUBLISH_AUTH_BASIC = "basic"
 PUBLISH_AUTH_KINDS = (PUBLISH_AUTH_TOKEN, PUBLISH_AUTH_BASIC)
 DEFAULT_PUBLISH_AUTH = PUBLISH_AUTH_TOKEN
+
+#: How the hardware run reaches the registry it installs from (.dsh/plan.md D41).
+#: The read registry need not be the publish registry: consumers point at a group
+#: repository that aggregates the private one, and that address is configuration, not
+#: a secret. "none" is a real answer - an open group needs no credential - and it is
+#: kept distinct from "token"/"basic" so a read credential is never inherited from the
+#: publish side by accident.
+PHYSICAL_AUTH_NONE = "none"
+PHYSICAL_AUTH_KINDS = (PHYSICAL_AUTH_NONE, PUBLISH_AUTH_TOKEN, PUBLISH_AUTH_BASIC)
+PHYSICAL_SOURCE_REGISTRY = "registry"
+PHYSICAL_SOURCE_TARBALL = "tarball"
+PHYSICAL_SOURCES = (PHYSICAL_SOURCE_REGISTRY, PHYSICAL_SOURCE_TARBALL)
+DEFAULT_PHYSICAL_SOURCE = PHYSICAL_SOURCE_REGISTRY
+
+#: Exit codes the generated physical wrapper maps to verdicts. A hardware run has to
+#: distinguish "the machine cannot reach the registry" from "the artifact is wrong":
+#: the first is an environment problem, the second is news about the package.
+EXIT_ENVIRONMENT = 10
+EXIT_REGISTRY = 11
+EXIT_DIGEST = 12
+EXIT_INSTALL = 13
+EXIT_EXECUTE = 14
 
 #: Reference names that move and therefore cannot pin a source tree.
 MUTABLE_REFS = frozenset(
@@ -307,6 +344,53 @@ def validate_stat(target: Target, stat: dict) -> list[str]:
         problems.extend(_validate_publish_entries(target, publish))
 
     problems.extend(_validate_upstream_increments(target, stat.get("upstream_increments")))
+    problems.extend(validate_physical(target, stat.get("physical")))
+
+    return problems
+
+
+def validate_physical(target: Target, physical) -> list[str]:
+    """Rules for the optional ``physical:`` section (hardware verification, D41).
+
+    The section says where a hardware run installs from, not what it publishes, so it
+    is validated separately from ``npm_publish``: a recipe may publish to a private
+    registry with basic auth and read from an open group anonymously.
+    """
+    problems: list[str] = []
+    if physical is None:
+        return problems
+    if not isinstance(physical, dict):
+        return [
+            "physical must be a mapping (registry, auth, source, token_env)"
+        ]
+
+    registry = str(physical.get("registry") or "").strip()
+    if not registry:
+        problems.append(
+            "physical.registry is required: the hardware run installs from a registry, "
+            "which need not be the one the recipe publishes to"
+        )
+    elif not registry.startswith(("https://", "http://")):
+        problems.append(
+            f"physical.registry must be an http(s) URL, got '{registry}'"
+        )
+
+    auth = str(physical.get("auth") or PHYSICAL_AUTH_NONE).strip().lower()
+    if auth not in PHYSICAL_AUTH_KINDS:
+        problems.append(
+            f"physical.auth '{auth}' is not supported; use one of {PHYSICAL_AUTH_KINDS}"
+        )
+    elif auth != PHYSICAL_AUTH_NONE and not str(physical.get("token_env") or "").strip():
+        problems.append(
+            f"physical.auth '{auth}' needs physical.token_env: the variable holding "
+            "the credential for the read registry"
+        )
+
+    source = str(physical.get("source") or DEFAULT_PHYSICAL_SOURCE).strip().lower()
+    if source not in PHYSICAL_SOURCES:
+        problems.append(
+            f"physical.source '{source}' is not supported; use one of {PHYSICAL_SOURCES}"
+        )
 
     return problems
 

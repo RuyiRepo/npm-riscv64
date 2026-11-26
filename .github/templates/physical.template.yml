@@ -1,0 +1,68 @@
+name: "verify {{pkg.name}}@{{pkg.version}} on riscv64 hardware"
+description: "Generated from {{recipe.dir}} by scripts/render.py - do not edit by hand."
+
+# What this action is (.dsh/plan.md D41)
+#
+# The build pipeline proves the artifact inside a riscv64 container, which on a
+# non-riscv64 host means qemu. This action proves the *published* package on real
+# riscv64 silicon: it installs what a consumer would install, from the registry a
+# consumer reads, and runs the assertions the recipe says make the artifact usable
+# there.
+#
+# Two properties are deliberate:
+#
+#   * no docker. The runner this action is meant for already runs inside a container
+#     and docker-in-docker is unproven on it, so every step runs directly on the
+#     runner. Nothing here may call docker, docker run or --platform.
+#
+#   * install + verify only. It does not build, does not test, does not publish and
+#     does not touch the build cache: it answers one question - does the package we
+#     shipped work on hardware - and it answers it after the fact, so a hardware
+#     queue can never hold up a delivery.
+#
+# The steps come from the recipe (commands/verify) and from the renderer
+# (steps/install.sh, steps/physical.sh); this template only wires inputs to them.
+
+inputs:
+  plan:
+    description: "Publish report from the build run: a JSON object keyed by package name"
+    required: false
+    default: ""
+  expected_integrity:
+    description: "sha512 the pipeline published; the bytes installed here must hash to it"
+    required: false
+    default: ""
+  source:
+    description: "registry (default) or tarball (the build's fallback tarball)"
+    required: false
+    default: "{{physical.source}}"
+  tarball:
+    description: "Path to the fallback tarball, when source is tarball"
+    required: false
+    default: ""
+  registry:
+    description: "Read registry; defaults to physical.registry in .stat"
+    required: false
+    default: "{{physical.registry}}"
+  report:
+    description: "Directory the report is written to (default: the workspace)"
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: verify on hardware
+      shell: bash
+      env:
+        PHYSICAL_PLAN: ${{ inputs.plan }}
+        PHYSICAL_EXPECTED_INTEGRITY: ${{ inputs.expected_integrity }}
+        PHYSICAL_SOURCE: ${{ inputs.source }}
+        PHYSICAL_TARBALL: ${{ inputs.tarball }}
+        PHYSICAL_REGISTRY: ${{ inputs.registry }}
+        PHYSICAL_REPORT: ${{ inputs.report }}
+      run: |
+        set -euo pipefail
+        # The wrapper owns the isolated workspace, the environment gates, the hardware
+        # facts and the report; see scripts/physical_template.sh.
+        bash "{{steps.dir}}/steps/physical.sh"

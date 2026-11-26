@@ -1099,3 +1099,20 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
   不用 18 顶）；无 sudo 时接受"一次性手工装 + 之后只检查"；组仓库当前匿名可读，但 `physical.auth`
   保留且**与发布认证互相独立**（含 `none`）；兜底 tgz **只对 `served: unverified` 的目标上传**；
   矩阵形态按执行结果再调；`file` 缺失可退化为读 ELF 头 `e_machine == 243`，但须标记降级并提示更新环境。
+* **已实现（2026-11-26）**，模拟流水线未改，改动面：新模板 + 新工作流 + 新脚本
+  （`scripts/{auth_function,install_template,physical_template}.sh`、`scripts/physical_plan.mjs`）、
+  `scripts/render.py`/`scripts/recipe_lib.py` 支持第二模板、`scripts/publish_manifest.mjs --report`
+  与 publish 步骤写报告、三个配方的 `physical:` 段与 `commands/verify`、`tests/test_physical.py`
+  （37 条）+ golden 重生成。
+* 与计划的偏差（都记在下面，均出于执行中的具体证据）：
+  * 配方只提供 `verify`；`install` 由渲染器生成（可用 `commands/install` 覆盖）。计划里写成"两段都来自配方"，
+    实际安装动作必须由渲染器统一（摘要比对、npm 形状兼容、兜底判定都是渲染器的事）。
+  * 不引入 `uses:` 动态引用：物理工作流按"目录里有哪些 `steps/physical.sh`"循环调用（`bash` 直跑），
+    因此新增配方无需改 YAML；矩阵不再是硬编码，而是由 build 上传的 `physical-action-*` 决定。
+  * 物理作业**会 checkout 触发构建的那个 commit 的 `scripts/`**（`sparse-checkout`）：只为跑
+    `scripts/physical_plan.mjs`（合并报告 / 摘要 / 终判）。计划原写"不 checkout"，改为"只取 scripts"，
+    记为一次依赖增加（git 在 bootstrap 自检里报）。
+  * `--check-all` 对没有 `physical:` 的配方打印 `[SKIP]` 而不是失败；`verify` 片段存在但 `.stat` 无
+    `physical:` 时报错（半套契约不许留）。
+* 真机 M1 待用户执行（本机无法代劳）：node ≥ 20 与 npm 是否可用、sudo 情况、`file`/`flock` 是否在位、
+  组仓库从该机是否可达、组仓库的 manifest 是否带完整 `dist`（决定兜底触发频率）。

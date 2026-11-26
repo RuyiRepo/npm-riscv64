@@ -40,6 +40,16 @@ npm_publish:
     overlay:
       - prebuilds/linux-riscv64
 
+# Hardware verification (.dsh/plan.md D41): where a run on real riscv64 silicon
+# installs from. This is the *read* side and is deliberately separate from
+# npm_publish above - consumers point at a group repository that aggregates the
+# private one, and that group needs no credential while publishing does. Keeping the
+# two apart means a read credential is never inherited from the publish side.
+physical:
+  registry: https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-group
+  auth: none
+  source: registry
+
 upstream_increments:
   - patch: upstream/riscv64-prebuild.patch
     touches:

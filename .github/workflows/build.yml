@@ -212,6 +212,7 @@ jobs:
         env:
           PUBLISH_SCOPE: ${{ vars.PUBLISH_SCOPE }}
           PUBLISH_REGISTRY: ${{ vars.PUBLISH_REGISTRY }}
+          PHYSICAL_REGISTRY: ${{ vars.PHYSICAL_REGISTRY }}
         run: |
           set -euo pipefail
           args=(
@@ -226,6 +227,30 @@ jobs:
           if [ -n "${PUBLISH_REGISTRY:-}" ]; then
             echo "rewriting publish registry to $PUBLISH_REGISTRY"
             args+=(--publish-registry "$PUBLISH_REGISTRY")
+          fi
+          if [ -n "${PHYSICAL_REGISTRY:-}" ]; then
+            echo "rewriting the hardware read registry to $PHYSICAL_REGISTRY"
+            args+=(--physical-registry "$PHYSICAL_REGISTRY")
+          fi
+          python3 scripts/render.py "${args[@]}"
+
+      # The hardware run (.dsh/plan.md D41) does not build anything, so it needs the
+      # action rendered from this very commit, not from whatever main holds later. It
+      # is uploaded per recipe and downloaded by verify-physical.yml.
+      - name: Render the hardware action
+        if: needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true'
+        env:
+          PHYSICAL_REGISTRY: ${{ vars.PHYSICAL_REGISTRY }}
+        run: |
+          set -euo pipefail
+          args=(
+            --pkg "${{ matrix.target.pkg }}"
+            --ver "${{ matrix.target.ver }}"
+            --template .github/templates/physical.template.yml
+            --out-dir .physical-action
+          )
+          if [ -n "${PHYSICAL_REGISTRY:-}" ]; then
+            args+=(--physical-registry "$PHYSICAL_REGISTRY")
           fi
           python3 scripts/render.py "${args[@]}"
 
@@ -279,3 +304,34 @@ jobs:
           path: ${{ steps.cache.outputs.name }}.tar.gz
           if-no-files-found: error
           retention-days: 90
+
+      # What the publish step learned, for the hardware run: the digest it uploaded and
+      # whether the registry could confirm serving it.
+      - name: Upload publish report
+        if: needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-report-${{ matrix.target.slug }}
+          path: .publish-reports/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Kept only when the publish report says the registry serves nothing checkable
+      # (`served: unverified`); otherwise this upload finds no files and is skipped.
+      - name: Upload fallback tarball
+        if: needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-tarball-${{ matrix.target.slug }}
+          path: .physical-tarball/*.tgz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload the hardware action
+        if: needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-action-${{ matrix.target.slug }}
+          path: .physical-action
+          if-no-files-found: error
+          retention-days: 30
