@@ -1069,3 +1069,29 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
 * 决策：包体 ≥ 4 MiB 时 `--fetch-retries 1`（重试成本 = 整包重传）。
 * 教训：凡是"默认值恰好够用"的地方，都要问一句默认值度量的是什么；npm 的 5 分钟度量的是
   整条请求的墙钟，而不是连接的空闲。
+
+### D41 物理硬件验证层：模拟流水线之外，追加"真机装 + 真机跑"（计划见单独文件）
+
+* 目标（用户 2026-11-25）：产物不仅要在 riscv64 容器（模拟）里装得起、跑得通，还要在**真实
+  RISC-V 硬件**上装得起、跑得通，作为对用户的可信背书。计划全文：
+  `.dsh/物理验证计划-2026-11-25.md`（本条目只记摘要，细节以该文件为准）。
+* 形态：**保留现有模拟流水线不动**，新增**独立工作流** `verify-physical.yml`
+  （`workflow_run`/`workflow_dispatch`，`runs-on: [self-hosted, linux, riscv64]`），
+  跑在硬件上的**只有 install + verify 两步**；不构建、不发布、不参与缓存、不阻塞发布。
+* 无 docker：新模板 `.github/templates/physical.template.yml` 内**禁止出现 docker**
+  （DinD 支持存疑），步骤直接跑在 runner 上。
+* 读仓库 ≠ 发布仓库（用户确认）：新增 `.stat` 顶层 `physical` 段——
+  `registry: https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-group`（组仓库，
+  `auth`/`token_env` 语义同发布），`source: registry|tarball`；build 上传的 tgz 作兜底，
+  但兜底也必检"摘要仍等于主流程发出去的那份"。
+* 范围：每次只验**本次变化/发布的包**（由 build 新写的 `publish-report-<slug>.json` 驱动，静态矩阵 + `if:` 过滤）。
+* 常驻容器护肤：`mktemp` 隔离目录 + `trap` 清理 + `HOME`/`npm_config_cache` 隔离、绝不 `-g`；
+  `concurrency: physical-riscv`（不取消）+ 容器内 `flock`；`uname -m` 与磁盘下限前置自检；
+  作业 `timeout-minutes: 30`。
+* 首次安装一次即可（用户确认 node/file/flock 可能缺失）：幂等 `bootstrap` job，缺什么装什么
+  （riscv64 无官方 node 二进制，走发行版仓库）；无 sudo 时明确报 `environment` 而非静默失败。
+* 报告：job summary + `physical-report.<slug>.json`（三层摘要对齐：上传摘要 → 读回结论 → 物理机取回摘要），
+  失败分类区分 `environment`/`install`/`digest`/`execute`；**不回写仓库**（用户确认）。
+* 重档（上游套件 / 995 MB 缓存树恢复）暂不采用，后续只改 `verify` 片段即可扩充（用户确认）。
+* README `How it works` 增加**单配方视角流程图**（模拟层 + 物理层的完整链路）。
+* 教训（沿用 D39）：物理机与组仓库不通，要报"环境/网络"类失败，绝不能读成"产物坏了"。
