@@ -221,11 +221,11 @@ entirely - which is the intended setup for real use.
 GitHub publishes runner binaries for linux **x64 and arm64** only (no `riscv64`
 artifact in `actions/runner` releases), so plan for one of these:
 
-| setup | what runs where | trade-off |
-| --- | --- | --- |
-| runner on an x64/arm64 host, `binfmt_misc` installed | every container still emulates riscv64 | simplest and fully supported; better than hosted only because the box is yours and the images stay pulled |
-| runner on a `riscv64` host | containers run natively | needs a runner built for riscv64 yourself (.NET 8 on riscv64) - unsupported upstream, so only if you maintain it |
-| runner on x64/arm64, docker daemon on a `riscv64` host (`DOCKER_HOST=ssh://riscv64-host`) | containers run natively | the step mounts `$GITHUB_WORKSPACE` with `-v`, and that path is resolved on the *daemon's* host, so the same path (and the checkout) has to exist there - a shared filesystem at an identical path, or nothing works |
+| setup | what runs where | trade-off | which install below |
+| --- | --- | --- | --- |
+| runner on an x64/arm64 host, `binfmt_misc` installed | every container still emulates riscv64 | simplest and fully supported; better than hosted only because the box is yours and the images stay pulled | the archive, as printed |
+| runner on x64/arm64, docker daemon on a `riscv64` host (`DOCKER_HOST=ssh://riscv64-host`) | containers run natively | the step mounts `$GITHUB_WORKSPACE` with `-v`, and that path is resolved on the *daemon's* host, so the same path (and the checkout) has to exist there - a shared filesystem at an identical path, or nothing works | the archive, plus the `DOCKER_HOST` settings after it |
+| runner on a `riscv64` host | containers run natively | needs a runner built for riscv64 yourself (.NET 8 on riscv64) - unsupported upstream, so only if you maintain it | **not** the archive: there is no riscv64 download, so replace the download line with your own build |
 
 ### Install it
 
@@ -239,9 +239,11 @@ that archive are involved - no other scaffolding.
 
 ```bash
 mkdir -p ~/actions-runner && cd ~/actions-runner
-# URL and version come from Settings -> Actions -> Runners -> New runner
+# URL, version and architecture are printed by
+# Settings -> Actions -> Runners -> New runner; <arch> is x64 or arm64, and the page
+# picks it for the host you are on.
 curl -fsSL -o runner.tar.gz \
-  https://github.com/actions/runner/releases/download/v<version>/actions-runner-linux-x64-<version>.tar.gz
+  https://github.com/actions/runner/releases/download/v<version>/actions-runner-linux-<arch>-<version>.tar.gz
 tar xzf runner.tar.gz                      # brings config.sh, run.sh, svc.sh
 
 ./config.sh --url https://github.com/RuyiRepo/ruyirepo \
@@ -253,11 +255,33 @@ sudo ./svc.sh start
 ./svc.sh status                            # stop/uninstall exist too
 ```
 
+These commands are the whole installation for the first two setups - both keep the
+runner on a Linux x64/arm64 host, so the archive is the right one and nothing else is
+needed to register it. The third setup (a native riscv64 host) has no archive to
+download: it needs a runner you build and maintain yourself, and the commands above
+still apply once your build produces the same layout (`config.sh`, `run.sh`, `svc.sh`);
+if it only produces `run.sh`, supervise that instead.
+
 A host without systemd (containers, Alpine, WSL1) cannot use `svc.sh`; run
 `./run.sh` under your own supervisor instead (`tmux`, `s6`, `supervisord`, or a
 container that stays up) and keep the same label. `svc.sh` itself insists on root
 (`sudo`) because `systemctl` does, and honours `GITHUB_ACTIONS_RUNNER_SERVICE_TEMPLATE`
 if you need a custom unit.
+
+For the second setup, the install is the same and the difference is configuration:
+the runner talks to a riscv64 daemon instead of its own, so
+
+* `DOCKER_HOST=ssh://riscv64-host` goes in `~/actions-runner/.env`, which the runner
+  reads from its own root directory at startup and passes to every job (the systemd
+  unit needs no edit for this - the listener sets the variable itself);
+* the SSH key of the *runner* user must be able to reach the daemon host, and that user
+  must be in `docker` on it;
+* `$GITHUB_WORKSPACE` is bind-mounted as `-v "$GITHUB_WORKSPACE:/w"`, resolved on the
+  daemon's host: the same absolute path has to exist there with the checked-out tree,
+  which in practice means a shared filesystem (NFS/cephfs/9p) mounted at the identical
+  path on both machines;
+* `gh` is needed on the *runner* host (the cache restore runs there), not on the daemon
+  host.
 
 Requirements on the runner host:
 
