@@ -210,34 +210,69 @@ Things that surprise people the first time:
 
 ## Self-hosted runners
 
-The workflow runs on `ubuntu-latest` by default, which costs minutes of emulation:
-qemu runs the riscv64 container everywhere, and a Rust workspace (rolldown) spends
-most of its time in the emulated compiler. A self-hosted runner removes that - on a
-riscv64 host the containers run natively - and is the intended setup for real use.
+The workflow runs on `ubuntu-latest` by default, which costs minutes of emulation: qemu
+runs the riscv64 container everywhere, and a Rust workspace (rolldown) spends most of
+its time in the emulated compiler. A self-hosted runner moves the work onto a machine
+you control - and, if that machine is a `riscv64` docker host, off the emulator
+entirely - which is the intended setup for real use.
 
-Requirements on the runner:
+### Which host can actually run it
+
+GitHub publishes runner binaries for linux **x64 and arm64** only (no `riscv64`
+artifact in `actions/runner` releases), so plan for one of these:
+
+| setup | what runs where | trade-off |
+| --- | --- | --- |
+| runner on an x64/arm64 host, `binfmt_misc` installed | every container still emulates riscv64 | simplest and fully supported; better than hosted only because the box is yours and the images stay pulled |
+| runner on a `riscv64` host | containers run natively | needs a runner built for riscv64 yourself (.NET 8 on riscv64) - unsupported upstream, so only if you maintain it |
+| runner on x64/arm64, docker daemon on a `riscv64` host (`DOCKER_HOST=ssh://riscv64-host`) | containers run natively | the step mounts `$GITHUB_WORKSPACE` with `-v`, and that path is resolved on the *daemon's* host, so the same path (and the checkout) has to exist there - a shared filesystem at an identical path, or nothing works |
+
+### Install it
+
+The commands below are the ones `Settings -> Actions -> Runners -> New runner` prints
+for your repository - use that page for the current download URL, since the version
+changes often. `svc.sh` is **not** something you write: it is shipped inside the runner
+archive (a systemd wrapper generated from `systemd.svc.sh.template`, which writes
+`/etc/systemd/system/actions.runner.<repo>.<name>.service` from
+`bin/actions.runner.service.template`). Only `config.sh`, `run.sh` and `svc.sh` from
+that archive are involved - no other scaffolding.
+
+```bash
+mkdir -p ~/actions-runner && cd ~/actions-runner
+# URL and version come from Settings -> Actions -> Runners -> New runner
+curl -fsSL -o runner.tar.gz \
+  https://github.com/actions/runner/releases/download/v<version>/actions-runner-linux-x64-<version>.tar.gz
+tar xzf runner.tar.gz                      # brings config.sh, run.sh, svc.sh
+
+./config.sh --url https://github.com/RuyiRepo/ruyirepo \
+  --token <registration-token> \
+  --name riscv64-builder --labels riscv64-builder
+
+sudo ./svc.sh install "$USER"              # systemd unit, runs as you
+sudo ./svc.sh start
+./svc.sh status                            # stop/uninstall exist too
+```
+
+A host without systemd (containers, Alpine, WSL1) cannot use `svc.sh`; run
+`./run.sh` under your own supervisor instead (`tmux`, `s6`, `supervisord`, or a
+container that stays up) and keep the same label. `svc.sh` itself insists on root
+(`sudo`) because `systemctl` does, and honours `GITHUB_ACTIONS_RUNNER_SERVICE_TEMPLATE`
+if you need a custom unit.
+
+Requirements on the runner host:
 
 | what | why |
 | --- | --- |
 | Docker, and the runner user in the `docker` group | every build and test step is a container |
-| `riscv64` binfmt when the host is not riscv64 | otherwise `docker run --platform linux/riscv64` fails immediately; on a riscv64 host it is native and costs nothing |
+| `riscv64` binfmt when the host is not a riscv64 docker host | otherwise `docker run --platform linux/riscv64` fails immediately; on a native daemon it costs nothing |
 | `gh` CLI on `PATH`, authenticated or with `GH_TOKEN` | the cache restore asks the artifacts API which run holds the tree |
-| ~50 GB disk, 8 cores, 16 GB RAM for a native riscv64 host | rolldown's cargo build and the toolchain images are the heavy part |
+| ~50 GB disk, 8 cores, 16 GB RAM | rolldown's cargo build and the toolchain images are the heavy part |
 | network access to the registry and to GHCR | toolchain images and upstream tarballs come from outside |
-
-Register it with a label, so the workflow can name exactly that runner:
-
-```bash
-# on the runner host, with a token from Settings -> Actions -> Runners
-./config.sh --url https://github.com/RuyiRepo/ruyirepo \
-            --token <registration-token> \
-            --name riscv64-builder --labels riscv64-builder
-sudo ./svc.sh install && sudo ./svc.sh start      # or run ./run.sh by hand
-```
 
 Then set the repository variable `RISCV_RUNNER=riscv64-builder`; `build.yml` uses it
 for both jobs (`runs-on: ${{ vars.RISCV_RUNNER || 'ubuntu-latest' }}`), so a self-hosted
-setup needs no workflow edit. Leaving it unset keeps the hosted runners.
+setup needs no workflow edit. The variable is one label, and the runner must carry
+exactly that label. Leaving it unset keeps the hosted runners.
 
 Two things a self-hosted runner changes about the build:
 
@@ -249,19 +284,16 @@ Two things a self-hosted runner changes about the build:
   trees - correct, and worth knowing when a run unexpectedly rebuilds;
 * **`--user` mapping.** Containers run as the calling user (the runner user), and the
   workspace belongs to it too; a runner started as a system service with a different
-  uid than the checkout can leave unreadable files. Keep the service user and the
-  work directory owner the same.
-
-With qemu absent and a riscv64 host, nothing else is needed: the recipes' `toolchain:
-native` becomes a native build, and only a `cross` recipe still uses the amd64 image.
+  uid than the checkout can leave unreadable files. `./svc.sh install "$USER"` keeps
+  them the same - and the same rule applies to the daemon host in the `DOCKER_HOST` case.
 
 ## Publishing
 
 Every recipe names its registry in `.stat`; the examples below use
 `https://npm.example.com/repository/npm-local` as a stand-in for it - read that as
-"the registry you publish to", not as an address this repository ships. (While the
-model is being validated the `.stat` files point at an internal test repository, and
-that address is a placeholder: it promises nothing about content or availability.)
+"the registry you publish to", not as an address this repository ships. The address in
+`.stat` is deployment configuration: read it from there, not from this document, and
+do not expect it to outlive the deployment behind it.
 
 Packages are published under the **upstream names**, unscoped (`bufferutil`,
 `utf-8-validate`, `rolldown`). That naming is deliberate: a consumer whose npm resolves

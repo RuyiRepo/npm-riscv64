@@ -78,7 +78,7 @@ npm_publish:
     name: example
     version: 1.0.0
     dir: .               # directory to publish, relative to the source root
-    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local
+    registry: https://npm.example.com/repository/npm-local   # the registry this recipe publishes to
     token_env: NODE_AUTH_TOKEN   # env var holding the credential (see §6)
     auth: basic          # token | basic
     # Which package the published tarball starts from (see §6):
