@@ -229,59 +229,9 @@ artifact in `actions/runner` releases), so plan for one of these:
 
 ### Install it
 
-The commands below are the ones `Settings -> Actions -> Runners -> New runner` prints
-for your repository - use that page for the current download URL, since the version
-changes often. `svc.sh` is **not** something you write: it is shipped inside the runner
-archive (a systemd wrapper generated from `systemd.svc.sh.template`, which writes
-`/etc/systemd/system/actions.runner.<repo>.<name>.service` from
-`bin/actions.runner.service.template`). Only `config.sh`, `run.sh` and `svc.sh` from
-that archive are involved - no other scaffolding.
-
-```bash
-mkdir -p ~/actions-runner && cd ~/actions-runner
-# URL, version and architecture are printed by
-# Settings -> Actions -> Runners -> New runner; <arch> is x64 or arm64, and the page
-# picks it for the host you are on.
-curl -fsSL -o runner.tar.gz \
-  https://github.com/actions/runner/releases/download/v<version>/actions-runner-linux-<arch>-<version>.tar.gz
-tar xzf runner.tar.gz                      # brings config.sh, run.sh, svc.sh
-
-./config.sh --url https://github.com/RuyiRepo/ruyirepo \
-  --token <registration-token> \
-  --name riscv64-builder --labels riscv64-builder
-
-sudo ./svc.sh install "$USER"              # systemd unit, runs as you
-sudo ./svc.sh start
-./svc.sh status                            # stop/uninstall exist too
-```
-
-These commands are the whole installation for the first two setups - both keep the
-runner on a Linux x64/arm64 host, so the archive is the right one and nothing else is
-needed to register it. The third setup (a native riscv64 host) has no archive to
-download: it needs a runner you build and maintain yourself, and the commands above
-still apply once your build produces the same layout (`config.sh`, `run.sh`, `svc.sh`);
-if it only produces `run.sh`, supervise that instead.
-
-A host without systemd (containers, Alpine, WSL1) cannot use `svc.sh`; run
-`./run.sh` under your own supervisor instead (`tmux`, `s6`, `supervisord`, or a
-container that stays up) and keep the same label. `svc.sh` itself insists on root
-(`sudo`) because `systemctl` does, and honours `GITHUB_ACTIONS_RUNNER_SERVICE_TEMPLATE`
-if you need a custom unit.
-
-For the second setup, the install is the same and the difference is configuration:
-the runner talks to a riscv64 daemon instead of its own, so
-
-* `DOCKER_HOST=ssh://riscv64-host` goes in `~/actions-runner/.env`, which the runner
-  reads from its own root directory at startup and passes to every job (the systemd
-  unit needs no edit for this - the listener sets the variable itself);
-* the SSH key of the *runner* user must be able to reach the daemon host, and that user
-  must be in `docker` on it;
-* `$GITHUB_WORKSPACE` is bind-mounted as `-v "$GITHUB_WORKSPACE:/w"`, resolved on the
-  daemon's host: the same absolute path has to exist there with the checked-out tree,
-  which in practice means a shared filesystem (NFS/cephfs/9p) mounted at the identical
-  path on both machines;
-* `gh` is needed on the *runner* host (the cache restore runs there), not on the daemon
-  host.
+The first two setups - both keep the runner on a Linux x64/arm64 host, so the archive is
+the right one and nothing else is needed to register it. The third setup (a native riscv64 host)
+has no archive to download: it needs a runner you build and maintain yourself.
 
 Requirements on the runner host:
 
