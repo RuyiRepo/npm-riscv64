@@ -201,7 +201,7 @@ publish_pkg() {
 }
 
 # Credentials first: publishing may need auth before it can answer.
-setup_auth "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/" "NODE_AUTH_TOKEN" "basic"
+setup_auth "https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/" "NODE_AUTH_TOKEN" "basic"
 
 # Publish order: platform packages first, then the package that references them
 # through optionalDependencies.
@@ -219,7 +219,7 @@ publish_pkg <<'PUBLISH_SPEC'
   "overlay": [
     "prebuilds/linux-riscv64"
   ],
-  "registry": "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/",
+  "registry": "https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/",
   "version": "4.2.0"
 }
 PUBLISH_SPEC

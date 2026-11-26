@@ -201,7 +201,7 @@ publish_pkg() {
 }
 
 # Credentials first: publishing may need auth before it can answer.
-setup_auth "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/" "NODE_AUTH_TOKEN" "basic"
+setup_auth "https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/" "NODE_AUTH_TOKEN" "basic"
 
 # Publish order: platform packages first, then the package that references them
 # through optionalDependencies.
@@ -250,7 +250,7 @@ publish_pkg <<'PUBLISH_SPEC'
     ],
     "publishConfig": {
       "access": "public",
-      "registry": "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/"
+      "registry": "https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/"
     },
     "repository": {
       "directory": "packages/rolldown",
@@ -262,7 +262,7 @@ publish_pkg <<'PUBLISH_SPEC'
   "name": "@rolldown/binding-linux-riscv64-gnu",
   "os": "linux",
   "readme_text": "# `@rolldown/binding-linux-riscv64-gnu`\n\nThis is the **riscv64gc-unknown-linux-gnu** binary for `@rolldown/binding`\n",
-  "registry": "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/",
+  "registry": "https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/",
   "version": "1.3.3"
 }
 PUBLISH_SPEC
@@ -276,7 +276,7 @@ publish_pkg <<'PUBLISH_SPEC'
   "optional": {
     "@rolldown/binding-linux-riscv64-gnu": "1.3.3"
   },
-  "registry": "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/",
+  "registry": "https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-local/",
   "version": "1.3.3"
 }
 PUBLISH_SPEC
