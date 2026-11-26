@@ -32,7 +32,10 @@ on:
   workflow_dispatch:
     inputs:
       run-id:
-        description: "Build run id to verify (default: the latest successful one)"
+        description: >-
+          Build run id to verify. Required when dispatched by hand: the build run that
+          published is not discoverable from this workflow without querying the API,
+          which the hardware runner has no credential for
         required: false
       slug:
         description: "Only verify this recipe slug (empty verifies every rendered one)"
@@ -75,6 +78,13 @@ jobs:
       - name: Check the runner and sweep stale runs
         run: |
           set -euo pipefail
+          # Fail before downloading anything when a manual dispatch names no build run:
+          # with no run id the artifact download would fail with a message about
+          # artifacts, which buries the actual mistake.
+          if [ -z "${RUN_ID:-}" ]; then
+            echo "no build run id: dispatch this workflow with the run that published" >&2
+            exit 1
+          fi
           echo "uname: $(uname -m)"
           for tool in node npm file flock git; do
             if command -v "$tool" >/dev/null 2>&1; then
