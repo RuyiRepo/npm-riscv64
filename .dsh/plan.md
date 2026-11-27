@@ -1114,5 +1114,11 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
     记为一次依赖增加（git 在 bootstrap 自检里报）。
   * `--check-all` 对没有 `physical:` 的配方打印 `[SKIP]` 而不是失败；`verify` 片段存在但 `.stat` 无
     `physical:` 时报错（半套契约不许留）。
-* 真机 M1 待用户执行（本机无法代劳）：node ≥ 20 与 npm 是否可用、sudo 情况、`file`/`flock` 是否在位、
-  组仓库从该机是否可达、组仓库的 manifest 是否带完整 `dist`（决定兜底触发频率）。
+* **真机已跑通（2026-11-27）**：三个配方 `verdict=ok`、`digest matches`，整轮约 3 分钟。实测
+  `uname -m=riscv64`、node `v20.19.2`、npm `9.2.0`、`flock` 在位、`file` **缺失**（ELF 退化为头检查）、
+  组仓库可达且两个配方能确认摘要、rolldown 的发布报告是 `served: unverified` 走了兜底 tgz 且摘要一致。
+  随之修了三处（详见变更日志 §4.6）：片段 shell 里 `log` 未导出（`export -f log`）、板卡型号读不到
+  （增 `/proc/device-tree/model` 与更多 cpuinfo key）、摘要 note 把"缺 file"和"无摘要"混成一句；
+  并把 runner 工具清单做成可执行的 `scripts/physical_preflight.sh`（工作流第一步调用，永远 exit 0，
+  缺工具 → `environment` verdict 或报告里自报降级；README 与 spec §12.3a/§12.4 记了工具表与安装命令）。
+  剩余：补 `file` 后重跑一轮确认 `elf_check: file`；查清组仓库为何没给 rolldown 确认摘要。

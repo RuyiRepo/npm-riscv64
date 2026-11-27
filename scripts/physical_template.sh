@@ -160,7 +160,10 @@ physical_elf() { # path
   log "note: 'file' is missing, ELF was read from the header - install file when convenient"
   return 0
 }
-export -f physical_fact physical_check physical_elf
+# `log` is exported too: the helpers above are exported functions and they call it, so a
+# snippet that calls physical_elf from its own shell would otherwise print
+# "log: command not found" instead of the note (seen on the first hardware run).
+export -f log physical_fact physical_check physical_elf
 
 # ---------------------------------------------------------------------------
 # environment gates: a broken machine must not read as a broken artifact
@@ -277,8 +280,21 @@ environment_gate() {
   # tried; riscv64 has `isa`, x86 has `model name`.
   local model isa
   if [ -r /proc/cpuinfo ]; then
-    model="$(cpuinfo_field 'model name')"
     isa="$(cpuinfo_field 'isa')"
+  fi
+  # The board, when the kernel exposes one: `/proc/device-tree/model` is what real RISC-V
+  # boards carry ("SpacemiT K1 ...", "Sophgo ..."), and it is readable even where
+  # /proc/cpuinfo is not (containers usually hide the latter, not the former). The
+  # cpuinfo spellings are tried in order because kernels disagree: `model name` on x86,
+  # `uarch`/`model` on several RISC-V kernels, `CPU`/`Processor` on ARM.
+  if [ -r /proc/device-tree/model ]; then
+    model="$(tr -d '\000' < /proc/device-tree/model)"
+  fi
+  if [ -z "$model" ] && [ -r /proc/cpuinfo ]; then
+    for key in 'model name' uarch model CPU Processor; do
+      model="$(cpuinfo_field "$key")"
+      [ -n "$model" ] && break
+    done
   fi
   physical_fact model "${model:-unknown}"
   physical_fact isa "${isa:-unknown}"

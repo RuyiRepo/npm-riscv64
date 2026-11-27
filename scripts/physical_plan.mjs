@@ -124,14 +124,43 @@ function summary(dir) {
       console.log("- `" + doc.pkg + "@" + doc.ver + "`: " + (doc.verdict || "?") + " - " + (detail || "no detail"));
     }
   }
-  const degraded = reports.filter(
-    (doc) => (doc.elf_check || "").includes("degraded") || (doc.checks || []).some((c) => c.result === "unknown")
-  );
-  if (degraded.length) {
+  // Two different weakenings, reported apart: one is about a tool the machine lacks, the
+  // other about evidence this run was not given. Lumping them ("file missing or no digest
+  // to compare") made a report that matched every digest look like it had none.
+  const headerOnly = reports.filter((doc) => (doc.elf_check || "").includes("degraded"));
+  if (headerOnly.length) {
     console.log("");
     console.log(
-      "Environment notes (`file` missing or no digest to compare): " +
-        degraded.map((doc) => "`" + doc.pkg + "`").join(", ")
+      "The ELF check read the header only (`file` is not installed on this runner): " +
+        headerOnly.map((doc) => "`" + doc.pkg + "`").join(", ")
+    );
+    console.log(
+      "Install it once (`apt-get install -y file`, `dnf install -y file`, `apk add file`) " +
+        "and rerun for the full description."
+    );
+  }
+  const noDigest = reports.filter((doc) => !doc.expected_integrity);
+  if (noDigest.length) {
+    console.log("");
+    console.log(
+      "No digest to compare (the run was given no publish report): " +
+        noDigest.map((doc) => "`" + doc.pkg + "`").join(", ")
+    );
+  }
+  const unknown = reports.filter((doc) => (doc.checks || []).some((c) => c.result === "unknown"));
+  if (unknown.length) {
+    console.log("");
+    console.log(
+      "Checks that could not be decided (`unknown`): " +
+        unknown.map((doc) => "`" + doc.pkg + "`").join(", ")
+    );
+  }
+  const noModel = reports.filter((doc) => !(doc.host || {}).model || (doc.host || {}).model === "unknown");
+  if (noModel.length) {
+    console.log("");
+    console.log(
+      "The board model could not be read (`/proc/device-tree/model` and /proc/cpuinfo both " +
+        "silent) for: " + noModel.map((doc) => "`" + doc.pkg + "`").join(", ")
     );
   }
 }
