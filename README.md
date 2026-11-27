@@ -51,37 +51,44 @@ packages/<pkg>/<version>/.stat      recipe: source, patches, build/test commands
 
 ### One recipe through both layers
 
-The map above says what the parts are. This is one recipe going through them, and the
-right-hand column names the file or step that does the work, so every box can be
-checked against the repository.
+The map above says what the parts are. This is the path any one recipe takes through
+them - `packages/<pkg>/<version>`, whichever package it is - with the right-hand column
+naming the file or step that does the work, so every line can be checked against the
+repository.
 
 ```
-  packages/bufferutil/4.2.0/.stat + commands/{build,test,verify}
+  packages/<pkg>/<version>/.stat + commands/*   (what to build, how, where it goes)
      │
-     │ scripts/render.py
-     ├──> .rendered/action/    action.yml + steps/{fetch,build,test,publish}.sh
+     │ scripts/render.py renders the same recipe twice, for two different jobs
+     ├──> .rendered/action/    action.yml + steps/{fetch,patch,build,test,publish}.sh
      └──> physical-action/     action.yml + steps/install.sh, physical.sh, verify.sh
 
   simulated pipeline - .github/workflows/build.yml, one matrix job per recipe
-    1  fetch    the upstream tree: git clone at the pinned ref      commands/fetch
-    2  build    inside the riscv64 image                            commands/build
-    3  test     inside the riscv64 image                            commands/test
-    4  cache    hit -> restore the tree; miss -> upload it          the build key
-    5  publish  npm publish --force, then read back what it serves  commands/publish
-    6  report   publish-reports/bufferutil.json {digest, served}    steps/publish.sh
-       artifact: prebuilds/linux-riscv64/bufferutil.node (what this recipe builds)
-       fallback: physical-tarball/bufferutil-4.2.0.tgz, only when the report says
+    1  fetch    the upstream tree: clone at the ref .stat pins      commands/fetch
+    2  patch    the recipe's patches/*.patch, when it has any       commands/patch
+    3  build    inside the riscv64 image                            commands/build
+    4  test     inside the riscv64 image                            commands/test
+    5  cache    hit -> restore the tree; miss -> upload it          the build key
+    6  publish  npm publish --force, then read back what is served  commands/publish
+    7  report   publish-reports/<pkg>.json: {digest, served}        steps/publish.sh
+       artifact: whatever .stat artifacts.path names - a prebuild, a binding package,
+                 a dist directory; this is what the recipe exists to produce
+       fallback: physical-tarball/<pkg>-<ver>.tgz, only when the report says
                  served: unverified - a confirmed digest already says what is served
-       generated: fetch, publish - and patch, when the recipe has patches/. bufferutil
-                 has none: its upstream/riscv64-prebuild.patch is an upstream PR
 
   hardware run - .github/workflows/verify-physical.yml, [self-hosted, linux, riscv64]
-    7  plan     merge the reports into physical/plan.json           physical_plan.mjs
-    8  gate     arch, node >= 20, disk, flock                       physical_template.sh
-    9  install  from the read registry, digest == the report        install_template.sh
-   10  verify   natively: resolve the prebuild, round-trip          commands/verify
-   11  report   physical-report-bufferutil.json + the summary       the wrapper
+    8  plan     merge the reports into physical/plan.json           physical_plan.mjs
+    9  gate     arch, node >= 20, disk, flock                       physical_template.sh
+   10  install  from the read registry, digest == the report        install_template.sh
+   11  verify   the recipe's own proof that it works here           commands/verify
+   12  report   physical-report-<pkg>.json + the job summary        physical.sh
 ```
+
+Every recipe takes exactly this path; what differs between them is only what the
+recipe says: which snippets it carries (`commands/patch` exists only for recipes with
+`patches/`, `fetch` and `publish` only when the recipe does not supply them), what
+`artifacts.path` points at, and what `commands/verify` asserts - that last one is the
+only thing the hardware run cannot do by itself, which is why the recipe must write it.
 
 Two different questions, and neither layer can answer the other's:
 
