@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Proves that the *published* rolldown wrapper works on real riscv64 hardware.
+#
+# The emulated test step runs upstream's bundle cases against the built workspace. This
+# step asks the consumer's question instead (.dsh/plan.md D41): after `npm install
+# rolldown` from the registry we publish to, does npm pull the riscv64 binding through
+# optionalDependencies, does the wrapper's loader find it, and does bundling actually
+# run on this CPU - with no workspace, no pnpm store and no build directory?
+#
+# Two properties of upstream's layout are part of the check, not incidental: the
+# wrapper must carry no .node file (a binary inside it would be published for every
+# CPU), and the binding must arrive as its own package.
+#
+# Inputs come from the generated wrapper (scripts/physical_template.sh):
+# PHYSICAL_CONSUMER holds the consumer project npm installed into. Facts and checks go
+# back through physical_fact / physical_check.
+set -euo pipefail
+
+consumer="${PHYSICAL_CONSUMER:?physical.sh sets PHYSICAL_CONSUMER}"
+pkg=rolldown
+pkg_dir="$consumer/node_modules/$pkg"
+[ -d "$pkg_dir" ] || {
+  echo "ERROR: $pkg is not installed in $consumer" >&2
+  exit 13
+}
+
+cat >"$PHYSICAL_WORK/verify.js" <<'JS'
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const consumer = process.env.PHYSICAL_CONSUMER;
+const emit = (kind, ...fields) => process.stdout.write([kind, ...fields].join('\t') + '\n');
+
+const pkgDir = path.join(consumer, 'node_modules', 'rolldown');
+
+// 1. The wrapper is JavaScript only. Upstream ships the binary as its own package, and
+//    a .node inside the wrapper would be offered to every CPU.
+const wrapperFiles = fs.readdirSync(pkgDir, { recursive: true, withFileTypes: true })
+  .filter((entry) => entry.isFile() && entry.name.endsWith('.node'));
+assert.deepStrictEqual(
+  wrapperFiles.map((entry) => entry.name),
+  [],
+  'the wrapper must not ship a .node file'
+);
+emit('check', 'wrapper-is-javascript', 'ok', 'no .node file inside the wrapper');
+
+// 2. The binding arrives because the wrapper lists it as an optional dependency - that
+//    is how a consumer on this platform gets a binary at all.
+const bindingName = '@rolldown/binding-linux-riscv64-gnu';
+const bindingDir = path.join(consumer, 'node_modules', ...bindingName.split('/'));
+assert.ok(
+  fs.existsSync(bindingDir),
+  `npm did not install ${bindingName}: optionalDependencies did not resolve`
+);
+const bindingFile = fs.readdirSync(bindingDir).filter((name) => name.endsWith('.node'));
+assert.strictEqual(
+  bindingFile.length,
+  1,
+  `expected exactly one .node in ${bindingName}, found ${bindingFile.length}`
+);
+const binding = path.join(bindingDir, bindingFile[0]);
+emit('fact', 'binding', binding);
+emit('check', 'binding-package', 'ok', `${bindingName} installed with ${bindingFile[0]}`);
+
+// 3. Run it: the loader resolves the platform package, the binding loads, and a bundle
+//    is produced. This is the part no amount of file inspection can substitute for.
+const entry = path.join(consumer, 'entry.js');
+fs.writeFileSync(entry, 'export const answer = 42;\n');
+(async () => {
+  const { rolldown } = require(pkgDir);
+  assert.strictEqual(typeof rolldown, 'function', 'the wrapper must export rolldown');
+  const bundle = await rolldown({ input: entry });
+  const { output } = await bundle.generate({ format: 'es' });
+  assert.ok(output.length > 0, 'bundling produced no output');
+  const code = output.map((chunk) => chunk.code).join('\n');
+  assert.ok(code.includes('42'), `the bundle lost the source value: ${code}`);
+  emit('check', 'bundle', 'ok', `${output.length} chunk(s), ${code.length} bytes, value preserved`);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+JS
+
+out="$PHYSICAL_WORK/verify.out"
+err="$PHYSICAL_WORK/verify.err"
+rc=0
+node "$PHYSICAL_WORK/verify.js" "$pkg_dir" >"$out" 2>"$err" || rc=$?
+
+binding=""
+while IFS=$'\t' read -r kind a b c; do
+  case "$kind" in
+    fact)
+      physical_fact "$a" "$b"
+      if [ "$a" = "binding" ]; then
+        binding="$b"
+      fi
+      ;;
+    check) physical_check "$a" "$b" "$c" ;;
+  esac
+done <"$out"
+
+if [ "$rc" -ne 0 ]; then
+  sed -e 's/^/  /' "$err" >&2
+  echo "ERROR: $pkg does not run on this hardware" >&2
+  exit 14
+fi
+
+if [ -z "$binding" ]; then
+  echo "ERROR: the binding path was not reported" >&2
+  exit 14
+fi
+physical_elf "$binding" || exit 14

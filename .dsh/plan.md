@@ -1069,3 +1069,50 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
 * 决策：包体 ≥ 4 MiB 时 `--fetch-retries 1`（重试成本 = 整包重传）。
 * 教训：凡是"默认值恰好够用"的地方，都要问一句默认值度量的是什么；npm 的 5 分钟度量的是
   整条请求的墙钟，而不是连接的空闲。
+
+### D41 物理硬件验证层：模拟流水线之外，追加"真机装 + 真机跑"（计划见单独文件）
+
+* 目标（用户 2026-11-25）：产物不仅要在 riscv64 容器（模拟）里装得起、跑得通，还要在**真实
+  RISC-V 硬件**上装得起、跑得通，作为对用户的可信背书。计划全文：
+  `.dsh/物理验证计划-2026-11-25.md`（本条目只记摘要，细节以该文件为准）。
+* 形态：**保留现有模拟流水线不动**，新增**独立工作流** `verify-physical.yml`
+  （`workflow_run`/`workflow_dispatch`，`runs-on: [self-hosted, linux, riscv64]`），
+  跑在硬件上的**只有 install + verify 两步**；不构建、不发布、不参与缓存、不阻塞发布。
+* 无 docker：新模板 `.github/templates/physical.template.yml` 内**禁止出现 docker**
+  （DinD 支持存疑），步骤直接跑在 runner 上。
+* 读仓库 ≠ 发布仓库（用户确认）：新增 `.stat` 顶层 `physical` 段——
+  `registry: https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-group`（组仓库，
+  `auth`/`token_env` 语义同发布），`source: registry|tarball`；build 上传的 tgz 作兜底，
+  但兜底也必检"摘要仍等于主流程发出去的那份"。
+* 范围：每次只验**本次变化/发布的包**（由 build 新写的 `publish-report-<slug>.json` 驱动，静态矩阵 + `if:` 过滤）。
+* 常驻容器护肤：`mktemp` 隔离目录 + `trap` 清理 + `HOME`/`npm_config_cache` 隔离、绝不 `-g`；
+  `concurrency: physical-riscv`（不取消）+ 容器内 `flock`；`uname -m` 与磁盘下限前置自检；
+  作业 `timeout-minutes: 30`。
+* 首次安装一次即可（用户确认 node/file/flock 可能缺失）：幂等 `bootstrap` job，缺什么装什么
+  （riscv64 无官方 node 二进制，走发行版仓库）；无 sudo 时明确报 `environment` 而非静默失败。
+* 报告：job summary + `physical-report.<slug>.json`（三层摘要对齐：上传摘要 → 读回结论 → 物理机取回摘要），
+  失败分类区分 `environment`/`install`/`digest`/`execute`；**不回写仓库**（用户确认）。
+* 重档（上游套件 / 995 MB 缓存树恢复）暂不采用，后续只改 `verify` 片段即可扩充（用户确认）。
+* README `How it works` 增加**单配方视角流程图**（模拟层 + 物理层的完整链路）。
+* 教训（沿用 D39）：物理机与组仓库不通，要报"环境/网络"类失败，绝不能读成"产物坏了"。
+* 二次讨论（同日，计划已升为 v2）：node **≥ 20 为硬门槛**（装不到就报 `environment` + 一次性手工命令，
+  不用 18 顶）；无 sudo 时接受"一次性手工装 + 之后只检查"；组仓库当前匿名可读，但 `physical.auth`
+  保留且**与发布认证互相独立**（含 `none`）；兜底 tgz **只对 `served: unverified` 的目标上传**；
+  矩阵形态按执行结果再调；`file` 缺失可退化为读 ELF 头 `e_machine == 243`，但须标记降级并提示更新环境。
+* **已实现（2026-11-26）**，模拟流水线未改，改动面：新模板 + 新工作流 + 新脚本
+  （`scripts/{auth_function,install_template,physical_template}.sh`、`scripts/physical_plan.mjs`）、
+  `scripts/render.py`/`scripts/recipe_lib.py` 支持第二模板、`scripts/publish_manifest.mjs --report`
+  与 publish 步骤写报告、三个配方的 `physical:` 段与 `commands/verify`、`tests/test_physical.py`
+  （37 条）+ golden 重生成。
+* 与计划的偏差（都记在下面，均出于执行中的具体证据）：
+  * 配方只提供 `verify`；`install` 由渲染器生成（可用 `commands/install` 覆盖）。计划里写成"两段都来自配方"，
+    实际安装动作必须由渲染器统一（摘要比对、npm 形状兼容、兜底判定都是渲染器的事）。
+  * 不引入 `uses:` 动态引用：物理工作流按"目录里有哪些 `steps/physical.sh`"循环调用（`bash` 直跑），
+    因此新增配方无需改 YAML；矩阵不再是硬编码，而是由 build 上传的 `physical-action-*` 决定。
+  * 物理作业**会 checkout 触发构建的那个 commit 的 `scripts/`**（`sparse-checkout`）：只为跑
+    `scripts/physical_plan.mjs`（合并报告 / 摘要 / 终判）。计划原写"不 checkout"，改为"只取 scripts"，
+    记为一次依赖增加（git 在 bootstrap 自检里报）。
+  * `--check-all` 对没有 `physical:` 的配方打印 `[SKIP]` 而不是失败；`verify` 片段存在但 `.stat` 无
+    `physical:` 时报错（半套契约不许留）。
+* 真机 M1 待用户执行（本机无法代劳）：node ≥ 20 与 npm 是否可用、sudo 情况、`file`/`flock` 是否在位、
+  组仓库从该机是否可达、组仓库的 manifest 是否带完整 `dist`（决定兜底触发频率）。

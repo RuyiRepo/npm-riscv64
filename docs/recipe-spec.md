@@ -108,6 +108,18 @@ npm_publish:
     engines:
       node: ^20.19.0 || >=22.12.0
 
+# Where the published package is verified on real riscv64 silicon (§12). Optional: a
+# recipe without this section is verified only inside the emulated container.
+physical:
+  registry: https://forgestash.artifact.yuantu.ac.cn/repository/npm-riscv-group
+  # none (default, an open group) | token | basic - independent of npm_publish auth:
+  # publishing uses a credential, reading a group repository need not.
+  auth: none
+  # the environment variable holding the credential, required for token/basic
+  token_env: NPM_READ_TOKEN
+  # registry (default) or tarball (install the build's fallback tarball instead)
+  source: registry
+
 # The increment offered back to upstream. Recorded, checked, never applied.
 upstream_increments:
   - patch: upstream/riscv64-prebuild.patch
@@ -134,19 +146,31 @@ Validation (the renderer refuses to build otherwise):
 | `upstream_increments[].patch` must live under `upstream/` and declare `touches` and `pr` | see §11 - those files are pull requests, not build inputs |
 | a `requires` entry must name another `npm_publish` entry of the same recipe, at the same version | a renamed dependency must not be silently accepted |
 | `toolchain` must be `native` or `cross` | the action only knows how to run those two build models |
+| `physical.registry` is required and must be an http(s) URL | a hardware run installs from a registry a consumer can read, which need not be the one the recipe publishes to |
+| `physical.auth` must be `none`, `token` or `basic`, and `token`/`basic` need `physical.token_env` | the credential is read from an environment variable, never written into a recipe |
+| `physical.source` must be `registry` or `tarball` | two ways to get the bytes, nothing else |
+| `commands/verify` is required exactly when `physical:` is present | a hardware step with nothing to assert would report a green light it did not earn |
 | package directories must not be empty | an empty directory is a half-finished recipe, not a recipe |
 
 ## 3. `commands/` snippets
 
-Five fixed names: `fetch`, `patch`, `build`, `test`, `publish`.
+Seven fixed names: `fetch`, `patch`, `build`, `test`, `publish`, `install`, `verify`.
 
 * `build` and `test` are **required** (from the version layer or `common`).
 * `fetch`, `patch`, `publish` are **generated** when absent (see §5, §6).
+* `install` and `verify` are used by the hardware template only (§12). `install` is
+  **generated** and may be overridden by a `commands/install` of your own; `verify` is
+  **required** exactly when `.stat` has a `physical:` section, because only the recipe
+  can say what makes its package usable on hardware.
+* The two sets are not alternatives: a recipe may carry all seven, and each template
+  renders the ones it needs (the pipeline action uses the first five, the hardware
+  action uses `install` and `verify`).
 * Any other file name in `commands/` is an error - a typo like `biuld` must not
   silently do nothing.
 * A snippet is plain shell, run with `bash` (`set -euo pipefail` is yours to add).
-  It runs either inside the riscv64 container (fetch/patch/build/test) or on the
-  runner (publish), with the working directory as described in §7.
+  It runs either inside the riscv64 container (fetch/patch/build/test), on the
+  runner (publish), or on the hardware runner (install/verify), with the working
+  directory as described in §7.
 
 ## 4. Merging `common` and `patches`
 
@@ -586,6 +610,7 @@ python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0 \
 | L0 | `python3 -m unittest tests.test_publish_plan` | the upload budget: size-derived timeout, retry reduction, cap and override |
 | L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio (`DSH_L2_PORT=4874` when a leftover container holds the default port); the first publish is a real 201, so this also rehearses the served-bytes assertion |
 | L2 (delivered) | `python3 tests/verify_published.py <pkg> <ver> [--shape …]` | the bytes a registry serves compared with upstream's: file by file, manifest field by field |
+| L2 (hardware) | `python3 tests/rehearse_physical.py --pkg <pkg> --ver <ver> --registry <url> [--token-env-file <file>]` | the hardware path end to end: publish, install from a registry, digest check, execute - everything except the silicon (§12.6) |
 | patches | `python3 scripts/check_patches.py [--network]` | `upstream/*.patch` are real diffs, declared, free of this repository's traces, and still apply |
 
 L1 and L2 need docker. L1 uses the toolchain images: `--image` (or `RISCV_IMAGE`)
@@ -650,3 +675,157 @@ the PR description, and `scripts/check_patches.py` (run by `--check-all`, and
 
 The generated `patch` step never mentions `upstream/`, and a test asserts that:
 build-time and upstream-facing patches cannot drift into each other.
+
+## 12. Hardware verification (`physical:`)
+
+A package that builds and passes its tests inside a riscv64 container has still not
+been installed by a real user on real silicon. The emulated container answers
+"the recipe works"; this layer answers "the published package works where it is
+going to be used": install what a consumer installs, from the registry a consumer
+reads, and run the recipe's assertions on the machine it targets.
+
+It is deliberately a **second, separate action**, not a sixth step of the build:
+
+| | build action (`action.template.yml`) | hardware action (`physical.template.yml`) |
+| --- | --- | --- |
+| where | a riscv64 container (qemu) | a `riscv64` self-hosted runner, no container |
+| what | fetch, patch, build, test, publish | install + verify, nothing else |
+| when | on every push / pull request | after a successful build that published |
+| question | does the recipe build? | does the *delivered* package work? |
+
+Why it is not part of the build pipeline: the hardware runner is scarce, its results
+must never gate a delivery, and the container already proves everything the build
+can prove. Why it installs instead of reusing the build tree: a hardware run that
+reads `src/` verifies bytes nobody can download.
+
+### 12.1 What the renderer produces
+
+`python3 scripts/render.py --pkg <name> --ver <version> --template .github/templates/physical.template.yml
+--out-dir <dir>` writes one composite action with exactly one step, which runs
+`steps/physical.sh`. That wrapper is generated (`scripts/physical_template.sh`) and
+is where the environment work happens:
+
+* the four scripts: `steps/install.sh` (generated, overridable by
+  `commands/install`), `steps/verify.sh` (the recipe's `commands/verify`), plus the
+  wrapper. There is no `fetch`, `patch`, `build`, `test` or `publish` script here,
+  and a rendered action that grows one is a bug;
+* `--check-all` checks both templates for every recipe that has one: the pipeline
+  action always, the hardware action when `.stat` has `physical:`, and says
+  `[SKIP]` for the rest instead of failing them. `--physical-registry <url>` rewrites
+  `physical.registry`, so a fork verifies against its own group repository without
+  editing a recipe.
+
+### 12.2 The install step
+
+Installing is the assertion here: npm's own resolution has to succeed, so a broken
+`optionalDependencies` entry (how a platform package is picked) fails the run even
+when the postinstall happens to pass. The step:
+
+1. reads the tarball npm would serve for `<name>@<version>` from `physical.registry`
+   (`npm pack --json`), and reads that answer in **both** shapes - an array (npm <=
+   10) and an object keyed by package name (npm >= 11). Reading one shape leaves
+   `filename` empty, which reads as "the registry has nothing", which is the D39
+   mistake in a new place;
+2. hashes the tarball it got (sha512 SRI, no network, no extra tooling) and compares
+   it with the digest the build's publish report recorded. Different bytes are a
+   failure naming both digests - not a retry, and not a fallback;
+3. writes the digest it installed into the report, so the evidence is the report and
+   not a log line;
+4. installs into a temporary consumer project (`npm install <tgz> --no-audit
+   --no-fund`), and refuses to continue when the installed manifest is not the
+   version asked for.
+
+The **fallback tarball** exists for exactly one situation: the publish report says
+`served: unverified` - the registry accepted the upload and serves nothing
+checkable - so the bytes cannot be confirmed by reading them back. Then the build
+keeps the tarball it uploaded, and the hardware run installs that file, comparing it
+against the same recorded digest. It is not a way around a network problem: with a
+digest in hand and a registry that cannot be read, the run reports a **registry**
+failure and stops, because a machine that cannot download is not evidence about the
+artifact.
+
+### 12.3 The verify step
+
+`commands/verify` is a plain shell snippet, and the verdict it reaches is the only
+thing that makes the run green. The contract it gets from the wrapper:
+
+| variable | what it is |
+| --- | --- |
+| `PHYSICAL_WORK` | the run's temporary directory (the consumer project is `$PHYSICAL_WORK/consumer`) |
+| `PHYSICAL_CONSUMER` | that consumer project |
+| `PHYSICAL_REGISTRY` | the read registry |
+| `PHYSICAL_SOURCE` | `registry` or `tarball` |
+| `PHYSICAL_TARBALL` | the fallback tarball, when one was used |
+| `PHYSICAL_EXPECTED_INTEGRITY` | the digest the pipeline published |
+
+and the collectors it writes with, which are exported functions:
+
+* `physical_fact <key> <value>` - one machine-readable fact (`binding`, `tarball`, …);
+  repeated keys keep the last value;
+* `physical_check <name> <result> <detail>` - one assertion, `ok`/`error`/`unknown`;
+* `physical_elf <path>` - asserts the file is a RISC-V ELF object. `file` answers
+  precisely; when `file` is not installed the ELF header is read instead (`e_machine
+  243`) and the report carries `elf_check: elf-header(degraded)` plus a note, because
+  a weaker check must not look like the same check.
+
+Exit codes are verdicts, and the report keeps them apart because they are different
+news for different people:
+
+| code | verdict | who has to act |
+| --- | --- | --- |
+| 0 | `ok` | nobody |
+| 10 | `environment` | the runner: wrong architecture, node < 20, no disk, another run holding the lock |
+| 11 | `registry` | the network or the credential, not the package |
+| 12 | `digest` | the artifact: the bytes here are not the bytes published |
+| 13 | `install` | the artifact: npm could not install it |
+| 14 | `execute` | the artifact: it installed and does not work here |
+
+### 12.4 Runner hygiene
+
+The hardware runner is a long-lived container that other jobs use, and it is
+configured by hand (no sudo in the step). So:
+
+* every run works inside one `mktemp -d` directory with its own `HOME`,
+  `npm_config_cache` and `npm_config_userconfig`, removed by a trap on every exit
+  path - including failure. Nothing is installed globally, ever;
+* a `flock` on `${PHYSICAL_LOCK:-$RUNNER_TEMP/physical-verify.lock}` plus
+  `concurrency: physical-riscv` (with `cancel-in-progress: false`) keep two runs
+  apart, and the workflow sweeps temporary directories older than six hours so a
+  killed run cannot poison the next one;
+* node >= 20 is a hard gate: verifying under a runtime a user does not run would
+  produce a green light nobody can reproduce. The failure names the one-time install
+  commands for the host instead of attempting them;
+* `PHYSICAL_KEEP_WORK=true` keeps the directory for inspection (a deliberate
+  debugging lever, never set by a workflow).
+
+### 12.5 The report
+
+`physical-report-<slug>.json` is written on **every** exit path, including
+`environment`, and holds the verdict, the digests (expected and installed), the
+binding the recipe found, what `file` said, the collected facts and checks, and the
+host (architecture, cpu model, ISA string, glibc, node, npm). The workflow renders it
+as a table in the job summary, uploads it as an artifact, and exits non-zero on
+anything but `ok`/`skipped`. Nothing is written back into the repository: the report
+is evidence, not state.
+
+### 12.6 Rehearsing without hardware
+
+Everything except the silicon can be rehearsed locally, and the rehearsal runs the
+same wrapper the hardware runner runs:
+
+```bash
+python3 tests/rehearse_physical.py --pkg bufferutil --ver 4.2.0 \
+    --registry http://127.0.0.1:4890 --token-env-file .dsh/tmp/token
+```
+
+It renders the publish action and publishes into the given registry, renders the
+physical action, merges the publish report into a plan, and runs `steps/physical.sh`
+inside the riscv64 image (`--network host`, workspace mounted at `/w`), then prints
+the verdict and the checks. The image's npm 9.2.0 exercises the array-shaped
+`npm pack --json`; npm 11/12 exercise the object shape.
+
+What the rehearsal cannot show is what a first real run reports as `environment`:
+node >= 20 availability, `file` and `flock` presence, the cpu model and ISA string,
+and whether that box can reach the registry. `PHYSICAL_ALLOW_FOREIGN_ARCH=true` is
+the only way to run the wrapper outside a riscv64 environment; it exists so the
+rehearsal is possible, and a workflow never sets it.

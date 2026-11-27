@@ -39,6 +39,15 @@ CONDITION_OPEN = re.compile(r"^\s*\{\{\s*#(if|unless)\s+([A-Za-z0-9_.\-]+)\s*\}\
 CONDITION_CLOSE = re.compile(r"^\s*\{\{\s*/(if|unless)\s*\}\}\s*$")
 
 DEFAULT_TEMPLATE = ".github/templates/action.template.yml"
+#: The hardware template (.dsh/plan.md D41): install + verify only, no docker anywhere.
+#: It is rendered for every recipe that carries a `verify` snippet, and its output is
+#: run on a self-hosted riscv64 runner after the build published something.
+DEFAULT_PHYSICAL_TEMPLATE = ".github/templates/physical.template.yml"
+#: Static shell bodies live as real files so `bash -n` can check them in L0 and the
+#: renderer never has to escape a multi-line script inside a Python literal.
+AUTH_FUNCTION_FILE = "auth_function.sh"
+INSTALL_TEMPLATE_FILE = "install_template.sh"
+PHYSICAL_TEMPLATE_FILE = "physical_template.sh"
 
 
 def normalize_registry(registry: str) -> str:
@@ -151,6 +160,11 @@ def substitute(text: str, variables: dict) -> tuple[str, set[str], set[str]]:
 
         def replace(match: re.Match) -> str:
             key = match.group(1)
+            # `${{ ... }}` is a GitHub expression, not one of this template's
+            # placeholders: the leading `$` is what tells them apart, and a rendered
+            # action has to keep expressions for GitHub to evaluate.
+            if match.start() > 0 and line[match.start() - 1] == "$":
+                return match.group(0)
             if key not in variables:
                 missing.add(key)
                 return match.group(0)
@@ -358,6 +372,21 @@ def manifest_helper_source() -> str:
     return _sibling(PUBLISH_TEMPLATE_FILE.replace("template.sh", "manifest.mjs"))
 
 
+def auth_function_source() -> str:
+    """setup_auth, shared by the publish step and the hardware step (scripts/auth_function.sh)."""
+    return _sibling(AUTH_FUNCTION_FILE)
+
+
+def install_template_source() -> str:
+    """The generated install step (scripts/install_template.sh)."""
+    return _sibling(INSTALL_TEMPLATE_FILE)
+
+
+def physical_template_source() -> str:
+    """The hardware wrapper (scripts/physical_template.sh)."""
+    return _sibling(PHYSICAL_TEMPLATE_FILE)
+
+
 def publish_template_source() -> str:
     """The publish script template, read from its own file (scripts/publish_template.sh).
 
@@ -541,10 +570,65 @@ def generate_publish(
         spec_blocks.append("publish_pkg <<'PUBLISH_SPEC'\n" + body + "\nPUBLISH_SPEC")
 
     template = publish_template_source()
+    template = template.replace("@@AUTH_FN@@", auth_function_source().rstrip("\n"))
     template = template.replace("@@AUTH@@", "\n".join(auth_lines))
     template = template.replace("@@SPECS@@", "\n\n".join(spec_blocks))
     template = template.replace("@@IDENT@@", str(target.ident))
     return template
+
+
+def generate_install(target: rl.Target, variables: dict) -> str:
+    """Generate the hardware install step (scripts/install_template.sh).
+
+    Installing a published package from the registry a consumer reads is the same
+    procedure for every recipe: pack it, prove the bytes are the ones the pipeline
+    published, then let npm resolve the rest. What differs per recipe is only *what*
+    proves it runs, and that is the recipe's own `verify` snippet.
+    """
+    template = install_template_source()
+    template = template.replace("@@NAME@@", str(variables.get("pkg.name") or target.pkg))
+    template = template.replace("@@VERSION@@", str(variables.get("pkg.version") or target.ver))
+    template = template.replace(
+        "@@SOURCE@@",
+        str(variables.get("physical.source") or rl.DEFAULT_PHYSICAL_SOURCE),
+    )
+    return template
+
+
+def generate_physical(target: rl.Target, variables: dict) -> str:
+    """Generate the hardware wrapper (scripts/physical_template.sh).
+
+    The wrapper owns what is the same for every recipe on hardware: the isolated
+    directory, the environment gates, the hardware facts and the report. The recipe's
+    `verify` snippet owns the assertions that only its artifact can satisfy.
+    """
+    template = physical_template_source()
+    registry = normalize_registry(str(variables.get("physical.registry") or ""))
+    auth_kind = str(variables.get("physical.auth") or rl.PHYSICAL_AUTH_NONE)
+    token_env = str(variables.get("physical.token_env") or "")
+    source = str(variables.get("physical.source") or rl.DEFAULT_PHYSICAL_SOURCE)
+
+    if auth_kind == rl.PHYSICAL_AUTH_NONE:
+        auth_lines = [
+            "# physical.auth is \"none\": the read registry is open, so no credential is",
+            "# written. A read credential is never inherited from the publish side.",
+        ]
+    else:
+        auth_lines = [
+            f'setup_auth "$PHYSICAL_REGISTRY" "{token_env}" "{auth_kind}"',
+        ]
+
+    template = template.replace("@@AUTH_FN@@", auth_function_source().rstrip("\n"))
+    template = template.replace("@@AUTH@@", "\n".join(auth_lines))
+    template = template.replace("@@IDENT@@", str(target.ident))
+    template = template.replace("@@NAME@@", str(variables.get("pkg.name") or target.pkg))
+    template = template.replace("@@VERSION@@", str(variables.get("pkg.version") or target.ver))
+    template = template.replace("@@SLUG@@", target.slug_pkg)
+    template = template.replace("@@REGISTRY@@", registry)
+    template = template.replace("@@SOURCE@@", source)
+    return template
+
+
 # --------------------------------------------------------------------------
 # variables
 # --------------------------------------------------------------------------
@@ -561,8 +645,17 @@ def flatten(prefix: str, value, out: dict) -> None:
         out[prefix] = "" if value is None else value
 
 
+def is_physical_template(template_name: str) -> bool:
+    return template_name.endswith("physical.template.yml")
+
+
 def build_variables(
-    target: rl.Target, stat: dict, layers: rl.Layers, recipe_dir: str, steps_dir: str
+    target: rl.Target,
+    stat: dict,
+    layers: rl.Layers,
+    recipe_dir: str,
+    steps_dir: str,
+    template_name: str = "action.template.yml",
 ) -> tuple[dict, dict[str, str]]:
     variables: dict = {}
     flatten("", stat, variables)
@@ -623,10 +716,45 @@ def build_variables(
         }
     )
 
+    artifact_glob = str((stat.get("artifacts") or {}).get("path") or "")
+    physical_section = stat.get("physical") if isinstance(stat.get("physical"), dict) else {}
+    if is_physical_template(template_name):
+        # Read registry: consumers point at a group repository, which need not be the
+        # one this recipe publishes to (D41). Auth belongs to the read side only, so a
+        # recipe that publishes with basic credentials can still read anonymously.
+        registry = normalize_registry(
+            str(physical_section.get("registry") or "")
+        )
+        variables.setdefault("physical.registry", registry)
+        variables["physical.registry"] = normalize_registry(
+            str(variables.get("physical.registry") or registry)
+        )
+        variables.setdefault(
+            "physical.auth", str(physical_section.get("auth") or rl.PHYSICAL_AUTH_NONE)
+        )
+        variables.setdefault(
+            "physical.source",
+            str(physical_section.get("source") or rl.DEFAULT_PHYSICAL_SOURCE),
+        )
+        variables.setdefault("physical.token_env", str(physical_section.get("token_env") or ""))
+
     scripts: dict[str, str] = {
         name: rl.read_snippet(path) for name, path in layers.commands.items()
     }
-    artifact_glob = str((stat.get("artifacts") or {}).get("path") or "")
+
+    if is_physical_template(template_name):
+        # The hardware action renders install + verify only. A recipe may override the
+        # install step (commands/install) but does not have to: how a published package
+        # is installed is the same everywhere, and one generated copy cannot drift.
+        allowed = ("install", "verify")
+        scripts = {name: body for name, body in scripts.items() if name in allowed}
+        if "install" not in scripts:
+            scripts["install"] = generate_install(target, variables)
+        scripts["physical"] = generate_physical(target, variables)
+        return variables, scripts
+
+    allowed = ("fetch", "patch", "build", "test", "publish")
+    scripts = {name: body for name, body in scripts.items() if name in allowed}
 
     if "fetch" not in scripts:
         scripts["fetch"] = generate_fetch(stat)
@@ -643,8 +771,19 @@ def build_variables(
 # --------------------------------------------------------------------------
 
 
-def check_rendered(target: rl.Target, rendered: str) -> list[str]:
-    """Structural checks on the rendered action."""
+def check_rendered(
+    target: rl.Target, rendered: str, template_name: str = "action.template.yml"
+) -> list[str]:
+    """Structural checks on the rendered action.
+
+    The expected step names depend on the template: the build action has the five steps
+    of the pipeline, the hardware action has one (it installs and verifies, and nothing
+    else - see .dsh/plan.md D41).
+    """
+    if is_physical_template(template_name):
+        expected_steps = ("verify",)
+    else:
+        expected_steps = ("fetch", "build", "test", "publish")
     problems: list[str] = []
     try:
         import yaml
@@ -667,7 +806,7 @@ def check_rendered(target: rl.Target, rendered: str) -> list[str]:
         problems.append(f"{target.ident}: rendered action has no steps")
 
     names = [str(step.get("name", "")) for step in steps if isinstance(step, dict)]
-    for expected in ("fetch", "build", "test", "publish"):
+    for expected in expected_steps:
         if not any(expected in name for name in names):
             problems.append(f"{target.ident}: missing step for '{expected}'")
 
@@ -702,12 +841,14 @@ def render_target(
     allow_unresolved: bool = False,
     publish_scope: str | None = None,
     publish_registry: str | None = None,
+    physical_registry: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Render one recipe.
 
     Returns ``(action_yaml, scripts)`` where ``scripts`` maps snippet names to
     the shell content that belongs in ``<out-dir>/steps/<name>.sh``.
     """
+    template_name = template.name
     target = rl.find_target(root, pkg, ver)
     stat = rl.load_stat(target)
     for dotted, value in (overrides or {}).items():
@@ -716,28 +857,48 @@ def render_target(
         apply_publish_scope(stat, publish_scope)
     if publish_registry:
         apply_publish_registry(stat, publish_registry)
+    if physical_registry:
+        apply_physical_registry(stat, physical_registry)
 
     problems = rl.validate_stat(target, stat)
     layers = rl.resolve_layers(root, target)
     problems.extend(f"{target.ident}: {p}" for p in layers.problems)
 
-    for name in rl.REQUIRED_SNIPPETS:
+    required = rl.required_snippets_for(template_name)
+    for name in required:
         if name not in layers.commands:
             problems.append(
                 f"{target.ident}: required command snippet '{name}' is missing "
-                f"(looked in commands/ of the version and of common/)"
+                f"(looked in commands/ of the version and of common/); "
+                f"the {template_name} template needs {', '.join(required)}"
             )
+
+    # Declaring hardware verification without saying what proves the artifact runs
+    # would render an action that installs and checks nothing.
+    if is_physical_template(template_name):
+        if not stat.get("physical"):
+            problems.append(
+                f"{target.ident}: the physical template needs a physical: section in "
+                ".stat (registry, auth, source) - see docs/recipe-spec.md"
+            )
+    elif "verify" in layers.commands and not stat.get("physical"):
+        problems.append(
+            f"{target.ident}: commands/verify exists but .stat has no physical: "
+            "section, so nothing ever runs it"
+        )
     if problems:
         raise RenderError("\n".join(problems))
 
     recipe_dir = rl.relative_recipe_dir(root, target)
     if steps_dir is None:
         steps_dir = f".rendered/{target.slug_pkg}/{target.slug_ver}"
-    variables, scripts = build_variables(target, stat, layers, recipe_dir, steps_dir)
+    variables, scripts = build_variables(
+        target, stat, layers, recipe_dir, steps_dir, template_name
+    )
     text = template.read_text(encoding="utf-8")
     rendered = render_template(text, variables, allow_unresolved=allow_unresolved)
 
-    problems.extend(check_rendered(target, rendered))
+    problems.extend(check_rendered(target, rendered, template_name))
     if problems:
         raise RenderError("\n".join(problems))
     return rendered, scripts
@@ -811,41 +972,79 @@ def apply_publish_registry(stat: dict, registry: str) -> None:
             entry["registry"] = url
 
 
+def apply_physical_registry(stat: dict, registry: str) -> None:
+    """Point the hardware run's read registry at another URL (fork, mirror, rehearsal)."""
+    url = registry.strip()
+    if not url:
+        raise RenderError("--physical-registry needs a registry URL")
+    if not isinstance(stat.get("physical"), dict):
+        stat["physical"] = {}
+    stat["physical"]["registry"] = url
+
+
 def cmd_check_all(args: argparse.Namespace) -> int:
     root = Path(args.root)
-    template = Path(args.template)
     targets = rl.enumerate_targets(root)
     if not targets:
         print(f"no recipes found under {root}")
         return 0
+
+    # Both templates are checked by default: a recipe is only as useful as the two
+    # actions rendered from it, and a hardware template that fails to render for a
+    # recipe is a hole nobody notices until a publish happens.
+    templates: list[Path] = [Path(DEFAULT_TEMPLATE)]
+    if args.template != DEFAULT_TEMPLATE:
+        templates = [Path(args.template)]
+    elif Path(DEFAULT_PHYSICAL_TEMPLATE).is_file():
+        templates.append(Path(DEFAULT_PHYSICAL_TEMPLATE))
 
     failures = 0
     for problem in rl.repository_problems(root):
         failures += 1
         print(f"[FAIL] repository: {problem}")
 
-    for target in targets:
-        try:
-            rendered, scripts = render_target(
-                root, target.pkg, target.ver, template, {}, allow_unresolved=args.allow_unresolved
+    for template in templates:
+        physical = is_physical_template(template.name)
+        for target in targets:
+            if physical:
+                stat = rl.load_stat(target)
+                layers = rl.resolve_layers(root, target)
+                if not stat.get("physical") or "verify" not in layers.commands:
+                    print(
+                        f"[SKIP] {target.ident}  (physical: the recipe does not claim "
+                        "hardware verification - no physical: section or no verify snippet)"
+                    )
+                    continue
+            try:
+                rendered, scripts = render_target(
+                    root,
+                    target.pkg,
+                    target.ver,
+                    template,
+                    {},
+                    allow_unresolved=args.allow_unresolved,
+                    physical_registry=args.physical_registry,
+                )
+            except RenderError as exc:
+                failures += 1
+                print(f"[FAIL] {target.ident} ({template.name})")
+                for line in str(exc).splitlines():
+                    print(f"       {line}")
+                continue
+            if not physical:
+                problems = check_patches.check_target(
+                    target, rl.load_stat(target), network=args.check_patches_network
+                )
+                for problem in problems:
+                    failures += 1
+                    print(f"[FAIL] {problem}")
+            steps = rendered.count("\n    - name:")
+            rendered_bytes = sum(len(body) for body in scripts.values())
+            print(
+                f"[ OK ] {target.ident} ({template.name})  "
+                f"(steps≈{steps}, scripts={','.join(sorted(scripts))}, "
+                f"{len(rendered)} bytes {rendered_bytes})"
             )
-        except RenderError as exc:
-            failures += 1
-            print(f"[FAIL] {target.ident}")
-            for line in str(exc).splitlines():
-                print(f"       {line}")
-            continue
-        problems = check_patches.check_target(
-            target, rl.load_stat(target), network=args.check_patches_network
-        )
-        for problem in problems:
-            failures += 1
-            print(f"[FAIL] {problem}")
-        steps = rendered.count("\n    - name:")
-        print(
-            f"[ OK ] {target.ident}  (steps≈{steps}, scripts={','.join(sorted(scripts))}, "
-            f"{len(rendered)} bytes)"
-        )
 
     # Upstream increments are documentation-grade, but a patch that cannot be
     # submitted is worse than no patch: check them together with the recipes.
@@ -858,7 +1057,10 @@ def cmd_check_all(args: argparse.Namespace) -> int:
     if checked:
         print(f"       ({checked} recipe(s) carry upstream increments)")
 
-    print(f"\nchecked {len(targets)} recipe(s), {failures} failure(s)")
+    print(
+        f"\nchecked {len(targets)} recipe(s) against {len(templates)} template(s), "
+        f"{failures} failure(s)"
+    )
     return 1 if failures else 0
 
 
@@ -902,6 +1104,11 @@ def main(argv: list[str] | None = None) -> int:
         help="point every publish target at this registry URL",
     )
     parser.add_argument(
+        "--physical-registry",
+        help="point the hardware run's read registry at this URL "
+        "(default: physical.registry from .stat)",
+    )
+    parser.add_argument(
         "--allow-unresolved",
         action="store_true",
         help="keep unresolved placeholders instead of failing (debugging only)",
@@ -942,6 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_unresolved=args.allow_unresolved,
             publish_scope=args.publish_scope,
             publish_registry=args.publish_registry,
+            physical_registry=args.physical_registry,
         )
     except rl.RecipeError as exc:
         print(f"error: {exc}", file=sys.stderr)

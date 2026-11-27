@@ -12,6 +12,7 @@
 //   --verify-integrity <spec> <tarball>   compare sha512 with base.integrity
 //   --prepare <spec> <dir>                write <dir>/package.json (+ README.md)
 //   --assert-served <spec> <dir>          fail unless the registry serves exactly these bytes
+//                         [--accepted] [--report <path>]  also write the evidence as JSON
 //   --plan <spec> <dir>                   P_PACKED_BYTES / P_FETCH_TIMEOUT for the upload
 //
 // The spec mirrors one npm_publish entry after the renderer resolved it:
@@ -429,11 +430,45 @@ if (mode === "--assert-served") {
   // resolve against itself.
   const dir = resolve(argv[2]);
   const accepted = argv.includes("--accepted");
+  // The report is what a hardware run reads (.dsh/plan.md D41): it carries the digest
+  // npm uploaded and whether the registry could confirm it serving those bytes. The
+  // fallback tarball is kept only when it could not, so the physical side decides with
+  // evidence rather than with a guess.
+  const reportIndex = argv.indexOf("--report");
+  if (reportIndex >= 0 && (argv[reportIndex + 1] || "").trim() === "") {
+    // An empty value would resolve to the current directory and fail with an opaque
+    // EISDIR from writeFileSync, so it is refused here with a message that says why.
+    fail("--report needs a path");
+  }
+  const reportPath = reportIndex >= 0 ? resolve(argv[reportIndex + 1]) : "";
   const capBytes = Number(process.env.PUBLISH_VERIFY_MAX_BYTES || 64 * 1024 * 1024);
   const strategy = (process.env.PUBLISH_VERIFY || "auto").toLowerCase();
 
   const ours = packedIntegrity(dir);
   if (ours.error) fail("cannot compute what this publish would upload: " + ours.error);
+
+  const evidence = {
+    name: spec.name,
+    version: spec.version,
+    registry: spec.registry,
+    integrity: ours.integrity,
+    shasum: ours.shasum || "",
+    size: ours.size,
+    accepted: accepted === true,
+    served: "",
+    detail: "",
+    tarball: "",
+    at: new Date().toISOString(),
+  };
+  // Written on every settled verdict, including the "accepted but unverifiable" one:
+  // a reader of the report must be able to tell "the registry confirmed the bytes" from
+  // "the upload worked and nobody could check what it serves".
+  const settle = (served, detail) => {
+    evidence.served = served;
+    evidence.detail = detail;
+    if (!reportPath) return;
+    writeFileSync(reportPath, JSON.stringify(evidence, null, 2) + "\n");
+  };
 
   const theirs = servedManifest();
   if (theirs.error) {
@@ -466,6 +501,7 @@ if (mode === "--assert-served") {
   // bytes are what a consumer would get (a failure).
   const unverifiable = (reason) => {
     if (accepted) {
+        settle("unverified", reason);
       console.log(
         "[publish] WARNING: " + reason + "; " + spec.name + "@" + spec.version +
           " was accepted but not verified"
@@ -493,7 +529,11 @@ if (mode === "--assert-served") {
     );
 
   if (strategy !== "tarball" && dist.integrity) {
-    if (dist.integrity !== ours.integrity) mismatch("the digests differ", dist.integrity);
+    if (dist.integrity !== ours.integrity) {
+      settle("mismatch", "dist.integrity " + dist.integrity);
+      mismatch("the digests differ", dist.integrity);
+    }
+    settle("dist.integrity", dist.integrity);
     console.log(
       "[publish] the registry serves this artifact (dist.integrity " +
         ours.integrity.slice(0, 19) + "...)"
@@ -517,7 +557,11 @@ if (mode === "--assert-served") {
           "nothing to compare with"
       );
     }
-    if (dist.shasum !== oursSha1) mismatch("the shasums differ", "sha1 " + dist.shasum);
+    if (dist.shasum !== oursSha1) {
+      settle("mismatch", "dist.shasum " + dist.shasum);
+      mismatch("the shasums differ", "sha1 " + dist.shasum);
+    }
+    settle("shasum", "sha1 " + dist.shasum);
     console.log(
       "[publish] the registry serves this artifact (dist.shasum " + oursSha1 + ")"
     );
@@ -534,11 +578,13 @@ if (mode === "--assert-served") {
   const servedIntegrity = sha512Sri(downloaded.bytes);
   if (servedIntegrity !== ours.integrity) {
     const servedSha1 = sha1Hex(downloaded.bytes);
+    settle("mismatch", "tarball " + servedIntegrity);
     mismatch(
       "the downloaded tarball differs (" + downloaded.bytes.length + " bytes, sha1 " +
         servedSha1 + ")", servedIntegrity
     );
   }
+  settle("tarball", servedIntegrity + ", " + downloaded.bytes.length + " bytes");
   console.log(
     "[publish] the registry serves this artifact (tarball sha512 " +
       servedIntegrity.slice(0, 19) + "..., " + downloaded.bytes.length + " bytes)"

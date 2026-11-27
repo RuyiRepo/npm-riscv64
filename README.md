@@ -18,6 +18,17 @@ packages/<pkg>/<version>/.stat      recipe: source, patches, build/test commands
         ├──> .github/workflows/build.yml
         │       pull_request -> fetch, patch, build, test
         │       push to main -> the same, plus publish
+        │       publishes, then hands three artifacts to the hardware run:
+        │       .publish-reports/*.json (the digest npm uploaded, and whether the
+        │       registry could confirm serving it), .physical-action/ (the same recipe
+        │       rendered for install+verify), and - only when the report says
+        │       `served: unverified` - .physical-tarball/*.tgz
+        │
+        ├──> .github/workflows/verify-physical.yml
+        │       after a successful build: installs the published package from the
+        │       read registry on a riscv64 machine, checks the digest, runs the
+        │       recipe's commands/verify; writes physical-report-<slug>.json
+        │       (verdict ok / environment / registry / digest / install / execute)
         │
         └──> docs/recipe-spec.md    the recipe format, in full
 ```
@@ -31,6 +42,10 @@ packages/<pkg>/<version>/.stat      recipe: source, patches, build/test commands
   guess.
 * Publishing is either a native package plus a small JS package that references it
   through `optionalDependencies`, or a single package that ships the prebuild.
+* The hardware run is the last question and the least urgent one: it asks whether the
+  *published* package installs and works on real silicon, after the fact, and never
+  gates a build or a publish. It runs no containers of its own (the runner it uses is
+  already one), and it installs what a user would install - not the build tree.
 
 ## Quick start
 
@@ -74,6 +89,18 @@ test fails, read the diff - when the change is intended, refresh the snapshot wi
 | L2 | `python3 tests/verify_published.py bufferutil 4.2.0` | what the registry serves, compared file by file with upstream's own tarball (`--shape prebuild\|wrapper\|platform`) |
 | patches | `python3 scripts/check_patches.py [--network]` | `upstream/*.patch` are real, declared, repository-free diffs that still apply |
 | L3 | GitHub Actions in a fork | emulated qemu, artifact reuse, real registry publishing |
+| L4 | `.github/workflows/verify-physical.yml` (or a manual run) | the published package installed and exercised on real riscv64 hardware |
+
+The hardware step can be rehearsed without hardware - everything except the silicon:
+
+```bash
+python3 tests/rehearse_physical.py --pkg bufferutil --ver 4.2.0 \
+    --registry http://127.0.0.1:4890 --token-env-file .dsh/tmp/token
+```
+
+It publishes to that registry, renders the hardware action, and runs it inside the
+riscv64 image against the registry, printing the verdict and the checks (see
+`docs/recipe-spec.md` §12.6).
 
 L1 and L2 need docker. For L1, build the toolchain image once:
 
@@ -247,6 +274,14 @@ Then set the repository variable `RISCV_RUNNER=riscv64-builder`; `build.yml` use
 for both jobs (`runs-on: ${{ vars.RISCV_RUNNER || 'ubuntu-latest' }}`), so a self-hosted
 setup needs no workflow edit. The variable is one label, and the runner must carry
 exactly that label. Leaving it unset keeps the hosted runners.
+
+A **separate** runner does the hardware verification (`verify-physical.yml`), and it is
+not interchangeable with the build one: it must carry the label set
+`[self-hosted, linux, riscv64]`, be real riscv64 hardware, have node >= 20 and npm,
+and needs neither docker nor sudo - the workflow installs nothing and removes what a
+killed run left behind. If the read registry needs a credential, set
+`secrets.NPM_READ_TOKEN`; the recipes name an open group repository, so by default
+none is read.
 
 Two things a self-hosted runner changes about the build:
 

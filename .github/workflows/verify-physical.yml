@@ -1,0 +1,234 @@
+name: verify on riscv64 hardware
+
+# The hardware layer of the delivery (.dsh/plan.md D41).
+#
+# The build pipeline proves the artifact inside a riscv64 container - on this setup that
+# means qemu. This workflow proves the *published* package on real riscv64 silicon:
+# install what a consumer installs, from the registry a consumer reads, and run the
+# assertions the recipe says make the artifact usable there.
+#
+# Deliberate properties:
+#
+#   * it runs after the fact. A build finishing triggers it; it never gates the build,
+#     the publish or the merge. Hardware is scarce, so a queue here must not hold up a
+#     delivery.
+#
+#   * it only verifies what that build published. The publish reports uploaded by the
+#     build decide the work; nothing is rebuilt, and nothing is verified twice.
+#
+#   * no docker. The runner this runs on is a container itself and docker-in-docker is
+#     unproven on it, so every step runs directly on the runner (see
+#     .github/templates/physical.template.yml).
+#
+#   * it leaves nothing behind. The runner is long-lived, so the steps work in
+#     temporary directories, and this workflow removes what earlier runs may have left
+#     if they were killed.
+
+on:
+  workflow_run:
+    workflows: ["build riscv64 packages"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: >-
+          Build run id to verify. Required when dispatched by hand: the build run that
+          published is not discoverable from this workflow without querying the API,
+          which the hardware runner has no credential for
+        required: false
+      slug:
+        description: "Only verify this recipe slug (empty verifies every rendered one)"
+        required: false
+
+permissions:
+  contents: read
+  actions: read # download the artifacts the build run produced
+
+# One hardware run at a time, and never cancel one: a half-cleaned temp directory is
+# exactly what this workflow exists to avoid.
+concurrency:
+  group: physical-riscv
+  cancel-in-progress: false
+
+jobs:
+  physical:
+    name: verify published packages on hardware
+    runs-on: [self-hosted, linux, riscv64]
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    env:
+      RUN_ID: ${{ inputs.run-id || github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      # Nothing is installed here that the run needs (the verification reports a missing
+      # tool as an environment verdict instead), but a stale directory from a killed run
+      # would be inherited by the next one, so it is removed when it is old enough.
+      # The rendered actions are the recipes' own scripts, from the commit that built the
+      # artifact, so the checkout here is that commit - and it comes first: `actions/
+      # checkout` cleans the workspace, which would delete the artifacts below if they
+      # were downloaded before it.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Check the runner and sweep stale runs
+        run: |
+          set -euo pipefail
+          # Fail before downloading anything when a manual dispatch names no build run:
+          # with no run id the artifact download would fail with a message about
+          # artifacts, which buries the actual mistake.
+          if [ -z "${RUN_ID:-}" ]; then
+            echo "no build run id: dispatch this workflow with the run that published" >&2
+            exit 1
+          fi
+          echo "uname: $(uname -m)"
+          for tool in node npm file flock git; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "$tool: $(command -v "$tool")"
+            else
+              echo "$tool: MISSING"
+            fi
+          done
+          node -v || true
+          npm -v || true
+
+          temp="${RUNNER_TEMP:-/tmp}"
+          swept=0
+          while IFS= read -r dir; do
+            [ -n "$dir" ] || continue
+            # Only directories this workflow could have created, and only old ones: a
+            # concurrent run holds the lock, a killed one left a corpse.
+            if [ -n "$(find "$dir" -maxdepth 0 -mmin +360 2>/dev/null)" ]; then
+              rm -rf "$dir"
+              swept=$((swept + 1))
+            fi
+          done < <(find "$temp" -maxdepth 1 -type d -name 'physical-*' 2>/dev/null || true)
+          echo "swept $swept stale temporary director(ies)"
+
+      - name: Download the publish reports
+        id: reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.RUN_ID }}
+          pattern: publish-report-*
+          path: .reports
+          merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download the rendered hardware actions
+        id: actions
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.RUN_ID }}
+          pattern: physical-action-*
+          path: .physical
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download the fallback tarballs
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.RUN_ID }}
+          pattern: physical-tarball-*
+          path: .tarballs
+          merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge the reports into a plan
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ ! -d .reports ] || [ -z "$(ls -A .reports 2>/dev/null)" ]; then
+            echo "this run published nothing that carries a report; nothing to verify"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node scripts/physical_plan.mjs --merge .reports --out .physical/plan.json
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ inputs.slug }}" ]; then
+            echo "restricting to ${{ inputs.slug }}"
+          fi
+
+      - name: Verify on hardware
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          SLUG: ${{ inputs.slug }}
+          READ_TOKEN: ${{ secrets.NPM_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p physical-reports
+          export PHYSICAL_PLAN="$PWD/.physical/plan.json"
+          export PHYSICAL_REPORT="$PWD/physical-reports"
+          export PHYSICAL_TARBALL_DIR="$PWD/.tarballs"
+          # A read registry that needs a credential: the recipe names the variable in
+          # physical.token_env, and the two spellings a recipe may use are both fed
+          # from one secret. An open group (the recipes here) needs none, and an empty
+          # value makes setup_auth say so instead of sending a blank credential.
+          export NODE_AUTH_TOKEN="${READ_TOKEN:-}"
+          export NPM_READ_TOKEN="${READ_TOKEN:-}"
+
+          failures=0
+          for dir in .physical/*/; do
+            [ -f "$dir/steps/physical.sh" ] || continue
+            slug="$(basename "$dir")"
+            if [ -n "${SLUG:-}" ] && [ "$slug" != "$SLUG" ]; then
+              continue
+            fi
+            echo "::group::hardware verification: $slug"
+            # Every package gets its own verdict: one broken artifact must not hide the
+            # others, so failures are collected rather than short-circuited.
+            rc=0
+            bash "$dir/steps/physical.sh" || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              failures=$((failures + 1))
+              echo "$slug failed with code $rc"
+            fi
+          done
+
+          if [ "$failures" -ne 0 ]; then
+            echo "$failures hardware verification(s) failed"
+          fi
+          # The step itself does not fail here: the verdict step below decides, after the
+          # summary and the artifacts exist - a failed run still has to explain itself.
+
+      - name: Summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Hardware verification"
+            echo ""
+            if [ -d physical-reports ]; then
+              node scripts/physical_plan.mjs --summary physical-reports
+            else
+              echo "_no hardware report was produced by this run_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the hardware report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-report
+          path: physical-reports
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail on a failed verification
+        if: always() && steps.plan.outputs.skip != 'true' 
+        run: |
+          set -euo pipefail
+          if [ ! -d physical-reports ]; then
+            echo "no report was produced: the verification did not run" >&2
+            exit 1
+          fi
+          # Exit code 1 for any verdict other than ok/skipped - including "environment",
+          # which means the machine could not attempt the verification at all.
+          node scripts/physical_plan.mjs --verdict physical-reports

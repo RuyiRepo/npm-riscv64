@@ -23,29 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-setup_auth() {
-  local registry="$1" token_env="$2" auth_kind="$3"
-  [ -n "$token_env" ] || return 0
-  if [ -z "${!token_env:-}" ]; then
-    log "no credential in $token_env; talking to $registry unauthenticated"
-    return 0
-  fi
-  # npm looks credentials up by the registry URL it talks to, path included:
-  # "//host/repository/name/" is the key for a registry at .../repository/name/.
-  local dart="${registry#*://}"
-  dart="${dart%%\?*}"
-  dart="//$dart"
-  [ "${dart: -1}" = "/" ] || dart="$dart/"
-  if [ "$auth_kind" = "basic" ]; then
-    # Basic credentials: base64 of user:password, as the registry asks for it
-    # (WWW-Authenticate: Basic).
-    printf '%s:_auth=${%s}\n' "$dart" "$token_env" >> "$NPM_CONFIG_USERCONFIG"
-  else
-    printf '%s:_authToken=${%s}\n' "$dart" "$token_env" >> "$NPM_CONFIG_USERCONFIG"
-  fi
-  log "auth configured for $dart via $token_env ($auth_kind)"
-}
-
+@@AUTH_FN@@
 publish_pkg() {
   # Reads one publish spec (JSON) from stdin, prepares the package directory and
   # publishes it. See generate_publish in scripts/render.py for the two kinds:
@@ -189,10 +167,60 @@ publish_pkg() {
   # absence of evidence is a warning (the artifact is there, just not checkable), while
   # after a refusal it is a failure (nothing at all shows our bytes are what a
   # consumer gets).
+  #
+  # The report this writes is the input of the hardware run (.dsh/plan.md D41): it
+  # carries the digest the upload had, so the machine that installs the package on real
+  # silicon can prove it installed the same bytes.
+  local report_dir report_path served_state tarball_name
+  report_dir="${PUBLISH_REPORT_DIR:-$REPO_ROOT/.publish-reports}"
+  mkdir -p "$report_dir"
+  report_path="$report_dir/$(printf '%s' "$P_NAME" | sed -e 's/@/_/g' -e 's|/|_|g').json"
   if [ -n "$accepted" ]; then
-    node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" --accepted || return 1
+    node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" \
+      --accepted --report "$report_path" || return 1
   else
-    node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" || return 1
+    node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" \
+      --report "$report_path" || return 1
+  fi
+  served_state="$(node -e '
+    const fs = require("node:fs");
+    process.stdout.write(String(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).served || ""));
+  ' "$report_path")"
+
+  # The one case that needs the bytes kept: the registry accepted the upload but serves
+  # nothing checkable, so a hardware run cannot tell whether it installed our artifact.
+  # Only then is a tarball uploaded for it - a confirmed digest already says the
+  # registry serves these bytes, and a machine failing to read them is that machine's
+  # problem, not a reason to verify something else.
+  if [ "$served_state" = "unverified" ]; then
+    mkdir -p "$REPO_ROOT/.physical-tarball"
+    # The name npm gives the tarball is the name the hardware run has to look for
+    # (`npm pack` strips the scope from the file name), so it is read from npm rather
+    # than guessed. The JSON answer is an array on npm <= 10 and a bare object on 11+.
+    tarball_name="$(npm pack "$abs_dir" --pack-destination "$REPO_ROOT/.physical-tarball" \
+      --ignore-scripts --loglevel error --json | node -e '
+        let raw = "";
+        process.stdin.on("data", (chunk) => (raw += chunk));
+        process.stdin.on("end", () => {
+          const doc = JSON.parse(raw);
+          process.stdout.write(String((Array.isArray(doc) ? doc[0] : doc).filename || ""));
+        });
+      ')" || {
+      log "cannot pack the fallback tarball for the hardware run"
+      return 1
+    }
+    [ -n "$tarball_name" ] || {
+      log "npm pack reported no file name for the fallback tarball"
+      return 1
+    }
+    log "the report cannot confirm what $P_REGISTRY serves; kept $tarball_name for the hardware run"
+    node -e '
+      const fs = require("node:fs");
+      const [path, name] = process.argv.slice(1);
+      const doc = JSON.parse(fs.readFileSync(path, "utf8"));
+      doc.tarball = name;
+      fs.writeFileSync(path, JSON.stringify(doc, null, 2) + "\n");
+    ' "$report_path" "$tarball_name"
   fi
   if [ -n "$refused" ]; then
     log "already published: $P_NAME@$P_VERSION (identical artifact, nothing to do)"
