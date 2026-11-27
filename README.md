@@ -49,6 +49,47 @@ packages/<pkg>/<version>/.stat      recipe: source, patches, build/test commands
   gates a build or a publish. It runs no containers of its own (the runner it uses is
   already one), and it installs what a user would install - not the build tree.
 
+### One recipe through both layers
+
+The map above says what the parts are. This is one recipe going through them, and the
+right-hand column names the file or step that does the work, so every box can be
+checked against the repository.
+
+```
+  packages/bufferutil/4.2.0/.stat + commands/{build,test,verify}
+     │
+     │ scripts/render.py
+     ├──> .rendered/action/    action.yml + steps/{fetch,build,test,publish}.sh
+     └──> physical-action/     action.yml + steps/install.sh, physical.sh, verify.sh
+
+  simulated pipeline - .github/workflows/build.yml, one matrix job per recipe
+    1  fetch    the upstream tree: git clone at the pinned ref      commands/fetch
+    2  build    inside the riscv64 image                            commands/build
+    3  test     inside the riscv64 image                            commands/test
+    4  cache    hit -> restore the tree; miss -> upload it          the build key
+    5  publish  npm publish --force, then read back what it serves  commands/publish
+    6  report   publish-reports/bufferutil.json {digest, served}    steps/publish.sh
+       artifact: prebuilds/linux-riscv64/bufferutil.node (what this recipe builds)
+       fallback: physical-tarball/bufferutil-4.2.0.tgz, only when the report says
+                 served: unverified - a confirmed digest already says what is served
+       generated: fetch, publish - and patch, when the recipe has patches/. bufferutil
+                 has none: its upstream/riscv64-prebuild.patch is an upstream PR
+
+  hardware run - .github/workflows/verify-physical.yml, [self-hosted, linux, riscv64]
+    7  plan     merge the reports into physical/plan.json           physical_plan.mjs
+    8  gate     arch, node >= 20, disk, flock                       physical_template.sh
+    9  install  from the read registry, digest == the report        install_template.sh
+   10  verify   natively: resolve the prebuild, round-trip          commands/verify
+   11  report   physical-report-bufferutil.json + the summary       the wrapper
+```
+
+Two different questions, and neither layer can answer the other's:
+
+| | proves | does not prove |
+| --- | --- | --- |
+| simulated (`build.yml`) | the recipe builds and its checks pass for riscv64; the registry accepted the bytes, and what it serves hashes to the digest it uploaded | that a real RISC-V CPU behaves the same - when the host is not riscv64 the container runs under qemu; that a consumer's install path works |
+| hardware (`verify-physical.yml`) | the published artifact installs from the registry a consumer reads, the bytes installed hash to the published digest, and the recipe's own `commands/verify` passes on that CPU | that the recipe builds anywhere else, or that every consumer scenario works; it says nothing about a build or a delivery, and cannot gate one |
+
 ## Quick start
 
 ```bash
