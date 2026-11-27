@@ -171,8 +171,11 @@ publish_pkg() {
   # The report this writes is the input of the hardware run (.dsh/plan.md D41): it
   # carries the digest the upload had, so the machine that installs the package on real
   # silicon can prove it installed the same bytes.
+  # Plain directory names, not dot-prefixed: the build workflow uploads these with
+  # actions/upload-artifact, which skips hidden files and directories by default - a
+  # ".publish-reports" path silently uploaded nothing once already.
   local report_dir report_path served_state tarball_name
-  report_dir="${PUBLISH_REPORT_DIR:-$REPO_ROOT/.publish-reports}"
+  report_dir="${PUBLISH_REPORT_DIR:-$REPO_ROOT/publish-reports}"
   mkdir -p "$report_dir"
   report_path="$report_dir/$(printf '%s' "$P_NAME" | sed -e 's/@/_/g' -e 's|/|_|g').json"
   if [ -n "$accepted" ]; then
@@ -193,11 +196,11 @@ publish_pkg() {
   # registry serves these bytes, and a machine failing to read them is that machine's
   # problem, not a reason to verify something else.
   if [ "$served_state" = "unverified" ]; then
-    mkdir -p "$REPO_ROOT/.physical-tarball"
+    mkdir -p "$REPO_ROOT/physical-tarball"
     # The name npm gives the tarball is the name the hardware run has to look for
     # (`npm pack` strips the scope from the file name), so it is read from npm rather
     # than guessed. The JSON answer is an array on npm <= 10 and a bare object on 11+.
-    tarball_name="$(npm pack "$abs_dir" --pack-destination "$REPO_ROOT/.physical-tarball" \
+    tarball_name="$(npm pack "$abs_dir" --pack-destination "$REPO_ROOT/physical-tarball" \
       --ignore-scripts --loglevel error --json | node -e '
         let raw = "";
         process.stdin.on("data", (chunk) => (raw += chunk));

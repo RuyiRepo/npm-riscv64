@@ -8,11 +8,15 @@ rendered/
 # What the build run hands to the hardware run, and what that run hands back:
 # the publish reports, the rendered hardware action, the conditional fallback tarball
 # and the hardware reports (.dsh/plan.md D41). All of it is an artifact of a run.
-.publish-reports/
-.physical-action/
-.physical-tarball/
-.physical/
+# The names are plain (not dot-prefixed) because actions/upload-artifact skips hidden
+# files and directories: a ".physical-action" path uploads nothing.
+publish-reports/
+physical-action/
+physical-tarball/
+physical/
 physical-reports/
+reports/
+tarballs/
 
 # Python bytecode
 __pycache__/
