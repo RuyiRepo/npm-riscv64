@@ -1,5 +1,7 @@
 # npm-riscv64
 
+[![build riscv64 packages](https://github.com/RuyiRepo/npm-riscv64/actions/workflows/build.yml/badge.svg)](https://github.com/RuyiRepo/npm-riscv64/actions/workflows/build.yml)
+
 Recipes for building riscv64 binaries of npm packages, plus the CI that turns them
 into published packages.
 
@@ -46,6 +48,54 @@ packages/<pkg>/<version>/.stat      recipe: source, patches, build/test commands
   *published* package installs and works on real silicon, after the fact, and never
   gates a build or a publish. It runs no containers of its own (the runner it uses is
   already one), and it installs what a user would install - not the build tree.
+
+### One recipe through both layers
+
+The map above says what the parts are. This is the path any one recipe takes through
+them - `packages/<pkg>/<version>`, whichever package it is - with the right-hand column
+naming the file or step that does the work, so every line can be checked against the
+repository.
+
+```
+  packages/<pkg>/<version>/.stat + commands/*   (what to build, how, where it goes)
+     │
+     │ scripts/render.py renders the same recipe twice, for two different jobs
+     ├──> .rendered/action/    action.yml + steps/{fetch,patch,build,test,publish}.sh
+     └──> physical-action/     action.yml + steps/install.sh, physical.sh, verify.sh
+
+  simulated pipeline - .github/workflows/build.yml, one matrix job per recipe
+    1  fetch    the upstream tree: clone at the ref .stat pins      commands/fetch
+    2  patch    the recipe's patches/*.patch, when it has any       commands/patch
+    3  build    inside the riscv64 image                            commands/build
+    4  test     inside the riscv64 image                            commands/test
+    5  cache    hit -> restore the tree; miss -> upload it          the build key
+    6  publish  npm publish --force, then read back what is served  commands/publish
+    7  report   publish-reports/<pkg>.json: {digest, served}        steps/publish.sh
+       artifact: whatever .stat artifacts.path names - a prebuild, a binding package,
+                 a dist directory; this is what the recipe exists to produce
+       fallback: physical-tarball/<pkg>-<ver>.tgz, only when the report says
+                 served: unverified - a confirmed digest already says what is served
+
+  hardware run - .github/workflows/verify-physical.yml, [self-hosted, linux, riscv64]
+    8  plan     merge the reports into physical/plan.json           physical_plan.mjs
+    9  gate     arch, node >= 20, disk, flock                       physical_template.sh
+   10  install  from the read registry, digest == the report        install_template.sh
+   11  verify   the recipe's own proof that it works here           commands/verify
+   12  report   physical-report-<pkg>.json + the job summary        physical.sh
+```
+
+Every recipe takes exactly this path; what differs between them is only what the
+recipe says: which snippets it carries (`commands/patch` exists only for recipes with
+`patches/`, `fetch` and `publish` only when the recipe does not supply them), what
+`artifacts.path` points at, and what `commands/verify` asserts - that last one is the
+only thing the hardware run cannot do by itself, which is why the recipe must write it.
+
+Two different questions, and neither layer can answer the other's:
+
+| | proves | does not prove |
+| --- | --- | --- |
+| simulated (`build.yml`) | the recipe builds and its checks pass for riscv64; the registry accepted the bytes, and what it serves hashes to the digest it uploaded | that a real RISC-V CPU behaves the same - when the host is not riscv64 the container runs under qemu; that a consumer's install path works |
+| hardware (`verify-physical.yml`) | the published artifact installs from the registry a consumer reads, the bytes installed hash to the published digest, and the recipe's own `commands/verify` passes on that CPU | that the recipe builds anywhere else, or that every consumer scenario works; it says nothing about a build or a delivery, and cannot gate one |
 
 ## Quick start
 
