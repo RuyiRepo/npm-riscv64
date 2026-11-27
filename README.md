@@ -327,11 +327,52 @@ exactly that label. Leaving it unset keeps the hosted runners.
 
 A **separate** runner does the hardware verification (`verify-physical.yml`), and it is
 not interchangeable with the build one: it must carry the label set
-`[self-hosted, linux, riscv64]`, be real riscv64 hardware, have node >= 20 and npm,
-and needs neither docker nor sudo - the workflow installs nothing and removes what a
-killed run left behind. If the read registry needs a credential, set
-`secrets.NPM_READ_TOKEN`; the recipes name an open group repository, so by default
-none is read.
+`[self-hosted, linux, riscv64]`, be real riscv64 hardware, and needs neither docker nor
+sudo - the workflow installs nothing at run time and removes what a killed run left
+behind. If the read registry needs a credential, set `secrets.NPM_READ_TOKEN`; the
+recipes name an open group repository, so by default none is read.
+
+#### What the hardware runner needs
+
+Ask the runner itself: `bash scripts/physical_preflight.sh` prints what it found, and the
+workflow runs the same script first, with the table added to the run's summary page. It
+never fails the job - a missing tool becomes an `environment` verdict, or a weaker check
+that names itself in the report, because a run that stopped would say nothing at all
+about the artifact.
+
+| tool | needed for | if missing |
+| --- | --- | --- |
+| `node` >= 20 and `npm` | the run installs like a consumer, so it uses the runtime a consumer has | hard gate: the report says `environment`, with the install line |
+| `bash` >= 4, `awk`, `grep`, `sed`, `mktemp`, `df`, `getconf`, `date`, `tar` | coreutils around the install and the report | hard gate, same verdict |
+| `file` | the full ELF description in the report | degrades to the ELF header check (`elf-header(degraded)`), and the summary says which packages were checked that way |
+| `flock` | a second lock beside the workflow's `concurrency` group | not an error: the concurrency group is the real lock |
+| `git` | only the workflow's own checkout | not needed by the verification |
+
+Install every one of them once, in the runner container:
+
+```bash
+# Debian/Ubuntu
+apt-get update && apt-get install -y file util-linux git
+# Fedora/RHEL/Alma/Amazon
+dnf install -y file util-linux git
+# Alpine
+apk add --update file util-linux git
+```
+
+Node >= 20 is the one that usually is not there, and the distro package is often older:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs
+```
+
+No sudo? Nothing here needs root at run time: ask the container owner to install the
+packages once, or drop a static build into a directory already on `PATH` (`file(1)` is
+available from <ftp://ftp.astron.com/pub/file/>). The verification itself runs as the
+runner user, inside `mktemp` directories it deletes.
+
+A package takes seconds to about a minute (three recipes finished in three minutes on
+the first real box), so a small machine is enough - what it needs is real silicon, not
+size.
 
 Two things a self-hosted runner changes about the build:
 

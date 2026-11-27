@@ -82,6 +82,20 @@ def stage_recipe(root: Path, pkg="demo", ver="1.0.0", stat=None, verify="echo ve
     return recipe
 
 
+def helper_block(text: str, name: str):
+    """The definition of one shell function, as it appears in a rendered script."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(name + "() {"):
+            if line.rstrip().endswith("}"):
+                return line
+            for end in range(index + 1, len(lines)):
+                if lines[end] == "}":
+                    return "\n".join(lines[index:end + 1])
+            return None
+    return None
+
+
 def render_physical(root: Path, pkg="demo", ver="1.0.0", physical_registry=None):
     """Render the physical template and write it the way the CLI does."""
     out = root / "out" / pkg.replace("/", "-")
@@ -232,6 +246,93 @@ class PhysicalTemplateTests(unittest.TestCase):
         self.assertIn('physical.auth is "none"', wrapper)
         self.assertNotIn("setup_auth ", wrapper)
 
+
+    def test_helpers_exported_to_a_snippet_can_log(self):
+        # A snippet runs in its own shell (bash "$SCRIPT_DIR/verify.sh"), so anything it
+        # calls has to be exported. physical_elf is exported and logs - an unexported log
+        # turned a note into "log: command not found" on the first hardware run, which is
+        # a message about the wrapper masquerading as a message about the artifact.
+        outputs = render_physical(self.tmp)
+        wrapper = read(outputs["steps/physical.sh"])
+        exported = [
+            line for line in wrapper.splitlines() if line.startswith("export -f ")
+        ]
+        self.assertTrue(exported)
+        names = set()
+        for line in exported:
+            names|= set(line[len("export -f "):].split())
+        for helper in ("log", "physical_fact", "physical_check", "physical_elf"):
+            self.assertIn(helper, names, "the snippet contract exports " + helper)
+
+    def test_a_snippet_shell_can_call_the_exported_elf_check_without_file(self):
+        # The regression this pins: the recipe snippets call `physical_elf`, which logs.
+        # Run in its own shell with `file` absent, the old wrapper printed
+        # "log: command not found" and dropped the note - a message about the wrapper that
+        # reads like a message about the artifact.
+        outputs = render_physical(self.tmp)
+        wrapper = read(outputs["steps/physical.sh"])
+        helpers = []
+        for name in ("log", "physical_fact", "physical_check", "physical_elf"):
+            block = helper_block(wrapper, name)
+            self.assertIsNotNone(block, "the wrapper defines " + name)
+            helpers.append(block)
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            elf = work / "demo.node"
+            # ELF64, little endian, e_machine 243 (RISC-V): header only, which is what the
+            # degraded check reads.
+            header = bytearray(64)
+            header[0:4] = b"\x7fELF"
+            header[4] = 2
+            header[5] = 1
+            header[16:18] = (3).to_bytes(2, "little")
+            header[18:20] = (243).to_bytes(2, "little")
+            elf.write_bytes(bytes(header))
+            # The export line comes from the wrapper, not from this test: that is the line
+            # whose contents the regression is about.
+            exports = [
+                line for line in wrapper.splitlines() if line.startswith("export -f ")
+            ]
+            self.assertEqual(len(exports), 1, exports)
+            setup = work / "helpers.sh"
+            setup.write_text(
+                "\n\n".join(helpers)
+                + '\nexport PHYSICAL_FACTS="%s/facts" PHYSICAL_CHECKS="%s/checks.jsonl"\n' % (work, work)
+                + ": > \"$PHYSICAL_FACTS\"; : > \"$PHYSICAL_CHECKS\"\n"
+                + exports[0] + "\n",
+                encoding="utf-8",
+            )
+            path = work / "PATH"
+            path.mkdir()
+            for name in ("bash", "sh", "node", "grep", "cat", "head", "awk", "printf"):
+                target = shutil.which(name)
+                if target:
+                    (path / name).symlink_to(target)
+            script = (
+                'source "%s"\n'
+                'bash -c \'set -euo pipefail; physical_elf "$1"\' _ "%s"\n'
+            ) % (setup, elf)
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, timeout=120,
+                env=dict(os.environ, PATH=str(path)),
+            )
+            checks = (work / "checks.jsonl").read_text(encoding="utf-8")
+            facts = (work / "facts").read_text(encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("command not found", result.stdout + result.stderr)
+        self.assertIn("file' is missing", result.stdout + result.stderr)
+        self.assertIn('"name":"elf"', checks.replace(" ", ""))
+        self.assertIn("elf-header(degraded)", facts)
+
+    def test_the_board_model_is_read_beyond_proc_cpuinfo(self):
+        # /proc/cpuinfo is often hidden inside the container a runner lives in, and not
+        # every riscv64 kernel has `model name`; a real board carries a device tree.
+        outputs = render_physical(self.tmp)
+        wrapper = read(outputs["steps/physical.sh"])
+        self.assertIn("/proc/device-tree/model", wrapper)
+        for key in ("uarch", "Processor"):
+            self.assertIn(key, wrapper)
 
 class PhysicalConfigValidationTests(unittest.TestCase):
     def setUp(self):
@@ -516,6 +617,74 @@ bash "$STUB_STEP"
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class PreflightTests(unittest.TestCase):
+    """The readiness report the runner prints, and the install advice it gives.
+
+    A hardware run must never stop because a tool is missing - it reports the machine as
+    the environment verdict and keeps going - so these tests assert the script exits zero
+    and names the fix, including the no-sudo path.
+    """
+
+    SCRIPT = ROOT / "scripts/physical_preflight.sh"
+
+    def run_preflight(self, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = str(path)
+        return subprocess.run(
+            ["bash", str(self.SCRIPT)], capture_output=True, text=True, env=env, timeout=120
+        )
+
+    def test_it_always_exits_zero_even_with_nothing_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Only bash: no node, no npm, no coreutils, not even uname.
+            bare = Path(tmp)
+            for name in ("bash", "sh"):
+                target = shutil.which(name)
+                if target:
+                    (bare / name).symlink_to(target)
+            result = self.run_preflight(bare)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("readiness:", result.stdout)
+        self.assertIn("node >= 20", result.stdout)
+
+    def test_a_missing_recommended_tool_says_what_to_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp)
+            for name in ("bash", "sh", "uname", "node", "npm", "awk", "mktemp", "df",
+                         "getconf", "date", "grep", "sed", "tar", "head", "cat", "flock"):
+                target = shutil.which(name)
+                if target:
+                    (staged / name).symlink_to(target)
+            result = self.run_preflight(staged)   # `file` is deliberately absent
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recommended file: MISSING", result.stdout)
+        # The advice has to be actionable in a container somebody else owns.
+        self.assertRegex(
+            result.stdout,
+            r"apt-get install -y file|dnf install -y file|apk add",
+        )
+        self.assertIn("no sudo", result.stdout)
+
+    def test_the_summary_table_names_the_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary.md"
+            subprocess.run(
+                ["bash", str(self.SCRIPT), "--summary", str(summary)],
+                capture_output=True, text=True, check=True, timeout=120,
+            )
+            text = summary.read_text(encoding="utf-8")
+        self.assertIn("| runner check | result |", text)
+        self.assertIn("| readiness |", text)
+
+    def test_it_names_this_machine_when_it_is_not_riscv64(self):
+        result = self.run_preflight()
+        # The rehearsal host is not riscv64, so this is the branch that runs here.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("required uname:", result.stdout)
+        self.assertNotIn("readiness: ok", result.stdout)
+
+
 class PlanHelperTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="dsh-plan-helper-"))
@@ -789,6 +958,16 @@ class WorkflowArtifactTests(unittest.TestCase):
                 "%s uploads the hidden path %r, which upload-artifact skips"
                 % (step.get("name"), path),
             )
+
+    def test_the_workflow_checks_the_runner_with_the_preflight(self):
+        # One place decides what a runner needs. If the workflow grew its own copy of that
+        # list again, the install advice in the docs could drift away from what runs.
+        runs = []
+        for job, step in self.steps(self.PHYSICAL):
+            runs.append(str(step.get("run", "")))
+        joined = "\n".join(runs)
+        self.assertIn("scripts/physical_preflight.sh", joined)
+        self.assertIn("GITHUB_STEP_SUMMARY", joined)
 
     def test_artifact_names_carry_no_slash(self):
         for job, step in self.steps(self.BUILD):

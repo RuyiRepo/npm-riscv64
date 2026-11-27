@@ -87,16 +87,11 @@ jobs:
             echo "no build run id: dispatch this workflow with the run that published" >&2
             exit 1
           fi
-          echo "uname: $(uname -m)"
-          for tool in node npm file flock git; do
-            if command -v "$tool" >/dev/null 2>&1; then
-              echo "$tool: $(command -v "$tool")"
-            else
-              echo "$tool: MISSING"
-            fi
-          done
-          node -v || true
-          npm -v || true
+          # What this machine has, and what to install when it lacks something. The
+          # script never fails the job: a missing tool becomes an environment verdict in
+          # the report (and a weaker check, never a silent pass), so the run still says
+          # something about the artifact. Its table goes to the run's summary page too.
+          bash scripts/physical_preflight.sh --summary "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
           temp="${RUNNER_TEMP:-/tmp}"
           swept=0

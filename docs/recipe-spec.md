@@ -780,6 +780,22 @@ news for different people:
 | 13 | `install` | the artifact: npm could not install it |
 | 14 | `execute` | the artifact: it installed and does not work here |
 
+### 12.3a The snippet contract
+
+A `commands/install` or `commands/verify` runs under `bash` in its own shell, and the
+wrapper hands it four helpers - the snippet never has to build JSON itself:
+
+| helper | what it does |
+| --- | --- |
+| `physical_fact <key> <value>` | records a machine/artifact fact (`uname_m`, `model`, `isa`, `glibc`, `elf`, `binding`, `installed_integrity`, ...) |
+| `physical_check <name> <result> <detail...>` | records one check: `ok`, `fail`, or `unknown` when this machine cannot decide |
+| `physical_elf <path>` | asserts the file is a RISC-V object - `file` when installed, the ELF header (`e_machine` 243) otherwise, marked `elf-header(degraded)` |
+| `log <message...>` | one `[physical]`-prefixed line, for a note the log should carry |
+
+All four are exported (`export -f`), because the snippets run in their own shells: a
+helper that calls another helper only works when both are exported, which is exactly
+how an unexported `log` became `log: command not found` on the first hardware run.
+
 ### 12.4 Runner hygiene
 
 The hardware runner is a long-lived container that other jobs use, and it is
@@ -797,6 +813,21 @@ configured by hand (no sudo in the step). So:
   commands for the host instead of attempting them;
 * `PHYSICAL_KEEP_WORK=true` keeps the directory for inspection (a deliberate
   debugging lever, never set by a workflow).
+
+What the machine itself needs, and what a missing tool does to the report, is a
+property of the wrapper, not of a recipe:
+
+* `node` >= 20, `npm`, `bash` >= 4 and the usual coreutils are **hard requirements** -
+  without them the wrapper reports the verdict `environment` and produces no
+  verification; the run still writes a report, so "the machine is not ready" is
+  distinguishable from "the artifact failed";
+* `file` is **optional**: the ELF check falls back to the header (`elf-header(degraded)`)
+  and the job summary names the packages checked that way;
+* `flock` is **optional**: the workflow's `concurrency` group is the real lock.
+
+`scripts/physical_preflight.sh` prints all of this for the machine in front of it, with
+the install command for the distribution it detects; the workflow runs it as its first
+step and adds its table to the run summary. It exits zero whatever it finds.
 
 ### 12.5 The report
 
