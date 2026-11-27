@@ -138,6 +138,20 @@ class PhysicalTemplateTests(unittest.TestCase):
         scripts = sorted(p.name for p in (action.parent / "steps").iterdir())
         self.assertEqual(scripts, ["install.sh", "physical.sh", "verify.sh"], scripts)
 
+    def test_a_recipe_may_override_the_generated_install_step(self):
+        # §3 of the spec says install is generated but overridable: a recipe that knows
+        # something the generated step cannot (a registry alias, a wrapper package)
+        # replaces it, and the physical action must run that file instead.
+        recipe = self.tmp / "packages" / "demo" / "1.0.0"
+        override = "#!/usr/bin/env bash\necho \"installed by the recipe\"\n"
+        (recipe / "commands" / "install").write_text(override, encoding="utf-8")
+        (recipe / "commands" / "install").chmod(0o755)
+        outputs = render_physical(self.tmp)
+        rendered = read(outputs["steps/install.sh"])
+        self.assertIn("installed by the recipe", rendered)
+        # The generated step's machinery must be gone, not merely preceded.
+        self.assertNotIn("PHYSICAL_EXPECTED_INTEGRITY", rendered)
+
     def test_the_docker_less_contract_is_stated_where_it_is_written(self):
         # The runner is a container and docker-in-docker is unproven on it, so no step
         # may grow a `docker run` through a later edit: the rendered steps are checked,

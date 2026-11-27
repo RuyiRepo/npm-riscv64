@@ -154,13 +154,17 @@ Validation (the renderer refuses to build otherwise):
 
 ## 3. `commands/` snippets
 
-Six fixed names: `fetch`, `patch`, `build`, `test`, `publish`, `verify`.
+Seven fixed names: `fetch`, `patch`, `build`, `test`, `publish`, `install`, `verify`.
 
 * `build` and `test` are **required** (from the version layer or `common`).
 * `fetch`, `patch`, `publish` are **generated** when absent (see §5, §6).
-* `install` and `verify` exist only for the hardware template (§12): `install` is
-  generated (a recipe may override it), `verify` comes from the recipe and is
-  required exactly when `.stat` has a `physical:` section.
+* `install` and `verify` are used by the hardware template only (§12). `install` is
+  **generated** and may be overridden by a `commands/install` of your own; `verify` is
+  **required** exactly when `.stat` has a `physical:` section, because only the recipe
+  can say what makes its package usable on hardware.
+* The two sets are not alternatives: a recipe may carry all seven, and each template
+  renders the ones it needs (the pipeline action uses the first five, the hardware
+  action uses `install` and `verify`).
 * Any other file name in `commands/` is an error - a typo like `biuld` must not
   silently do nothing.
 * A snippet is plain shell, run with `bash` (`set -euo pipefail` is yours to add).
