@@ -19,10 +19,10 @@ packages/<pkg>/<version>/.stat      recipe: source, patches, build/test commands
         │       pull_request -> fetch, patch, build, test
         │       push to main -> the same, plus publish
         │       publishes, then hands three artifacts to the hardware run:
-        │       .publish-reports/*.json (the digest npm uploaded, and whether the
-        │       registry could confirm serving it), .physical-action/ (the same recipe
+        │       publish-reports/*.json (the digest npm uploaded, and whether the
+        │       registry could confirm serving it), physical-action/ (the same recipe
         │       rendered for install+verify), and - only when the report says
-        │       `served: unverified` - .physical-tarball/*.tgz
+        │       `served: unverified` - physical-tarball/*.tgz
         │
         ├──> .github/workflows/verify-physical.yml
         │       after a successful build: installs the published package from the

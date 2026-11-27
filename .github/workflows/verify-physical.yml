@@ -38,7 +38,9 @@ on:
           which the hardware runner has no credential for
         required: false
       slug:
-        description: "Only verify this recipe slug (empty verifies every rendered one)"
+        description: >-
+          Only verify recipes whose artifact name contains this text, e.g. bufferutil or
+          4.2.0 (empty verifies every rendered action in that run)
         required: false
 
 permissions:
@@ -116,7 +118,7 @@ jobs:
         with:
           run-id: ${{ env.RUN_ID }}
           pattern: publish-report-*
-          path: .reports
+          path: reports
           merge-multiple: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -127,7 +129,7 @@ jobs:
         with:
           run-id: ${{ env.RUN_ID }}
           pattern: physical-action-*
-          path: .physical
+          path: physical
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download the fallback tarballs
@@ -136,7 +138,7 @@ jobs:
         with:
           run-id: ${{ env.RUN_ID }}
           pattern: physical-tarball-*
-          path: .tarballs
+          path: tarballs
           merge-multiple: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -144,12 +146,12 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
-          if [ ! -d .reports ] || [ -z "$(ls -A .reports 2>/dev/null)" ]; then
+          if [ ! -d reports ] || [ -z "$(ls -A reports 2>/dev/null)" ]; then
             echo "this run published nothing that carries a report; nothing to verify"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          node scripts/physical_plan.mjs --merge .reports --out .physical/plan.json
+          node scripts/physical_plan.mjs --merge reports --out physical/plan.json
           echo "skip=false" >> "$GITHUB_OUTPUT"
           if [ -n "${{ inputs.slug }}" ]; then
             echo "restricting to ${{ inputs.slug }}"
@@ -163,9 +165,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p physical-reports
-          export PHYSICAL_PLAN="$PWD/.physical/plan.json"
+          export PHYSICAL_PLAN="$PWD/physical/plan.json"
           export PHYSICAL_REPORT="$PWD/physical-reports"
-          export PHYSICAL_TARBALL_DIR="$PWD/.tarballs"
+          export PHYSICAL_TARBALL_DIR="$PWD/tarballs"
           # A read registry that needs a credential: the recipe names the variable in
           # physical.token_env, and the two spellings a recipe may use are both fed
           # from one secret. An open group (the recipes here) needs none, and an empty
@@ -174,13 +176,20 @@ jobs:
           export NPM_READ_TOKEN="${READ_TOKEN:-}"
 
           failures=0
-          for dir in .physical/*/; do
+          # Each artifact was downloaded into its own directory, named after the
+          # artifact: physical-action-<artifact>, where <artifact> is the package
+          # and version slugified (no slash, because artifact names cannot carry one).
+          for dir in physical/*/; do
             [ -f "$dir/steps/physical.sh" ] || continue
-            slug="$(basename "$dir")"
-            if [ -n "${SLUG:-}" ] && [ "$slug" != "$SLUG" ]; then
-              continue
+            name="$(basename "$dir")"           # physical-action-<artifact>
+            label="${name#physical-action-}"    # <artifact>: pkg-version-riscv64
+            if [ -n "${SLUG:-}" ]; then
+              case "$label" in
+                *"$SLUG"*) ;;
+                *) continue ;;
+              esac
             fi
-            echo "::group::hardware verification: $slug"
+            echo "::group::hardware verification: $label"
             # Every package gets its own verdict: one broken artifact must not hide the
             # others, so failures are collected rather than short-circuited.
             rc=0
@@ -188,7 +197,7 @@ jobs:
             echo "::endgroup::"
             if [ "$rc" -ne 0 ]; then
               failures=$((failures + 1))
-              echo "$slug failed with code $rc"
+              echo "$label failed with code $rc"
             fi
           done
 

@@ -756,6 +756,90 @@ def real_recipes():
     return found
 
 
+class WorkflowArtifactTests(unittest.TestCase):
+    """The build -> hardware handoff, as the workflows actually wire it.
+
+    Two failure modes were paid for by a red run in the fork, and neither is visible in
+    the Python or the shell: `actions/upload-artifact` skips hidden files and
+    directories (so a ".physical-action" path uploaded nothing), and it rejects `/` in
+    an artifact name (so `matrix.target.slug`, which is "pkg/version", cannot be used).
+    """
+
+    INVALID_NAME_CHARS = set('/\\:*?"<>|')
+    BUILD = ROOT / ".github/workflows/build.yml"
+    PHYSICAL = ROOT / ".github/workflows/verify-physical.yml"
+
+    def steps(self, path):
+        doc = __import__("yaml").safe_load(path.read_text(encoding="utf-8"))
+        for job in doc["jobs"].values():
+            for step in job.get("steps") or []:
+                yield job, step
+
+    def test_uploaded_paths_are_not_hidden(self):
+        for job, step in self.steps(self.BUILD):
+            if not str(step.get("uses", "")).startswith("actions/upload-artifact"):
+                continue
+            path = str((step.get("with") or {}).get("path", ""))
+            hidden = [
+                part for part in path.split("/")
+                if part.startswith(".") and part not in (".", "..")
+            ]
+            self.assertEqual(
+                hidden, [],
+                "%s uploads the hidden path %r, which upload-artifact skips"
+                % (step.get("name"), path),
+            )
+
+    def test_artifact_names_carry_no_slash(self):
+        for job, step in self.steps(self.BUILD):
+            if not str(step.get("uses", "")).startswith("actions/upload-artifact"):
+                continue
+            name = str((step.get("with") or {}).get("name", ""))
+            literal = name.split("${{")[0]
+            self.assertEqual(
+                sorted(set(literal) & self.INVALID_NAME_CHARS), [],
+                "artifact name %r has an invalid character" % name,
+            )
+            # `matrix.target.slug` is "pkg/version"; `matrix.target.artifact` is the
+            # slugified form (no slash, scoped packages included).
+            self.assertNotIn("matrix.target.slug", name,
+                             "artifact name %r would contain a slash" % name)
+
+    def test_the_hardware_run_reads_the_names_the_build_writes(self):
+        download = [
+            str((step.get("with") or {}).get("pattern", ""))
+            for job, step in self.steps(self.PHYSICAL)
+            if str(step.get("uses", "")).startswith("actions/download-artifact")
+        ]
+        uploaded = [
+            str((step.get("with") or {}).get("name", ""))
+            for job, step in self.steps(self.BUILD)
+            if str(step.get("uses", "")).startswith("actions/upload-artifact")
+        ]
+        self.assertTrue(download and uploaded)
+        for pattern in download:
+            prefix = pattern.rstrip("*")
+            self.assertTrue(
+                any(name.startswith(prefix) for name in uploaded),
+                "no uploaded artifact matches %r (uploaded: %s)" % (pattern, uploaded),
+            )
+
+    def test_no_local_directory_the_workflows_use_is_hidden(self):
+        for job, step in self.steps(self.PHYSICAL):
+            run = str(step.get("run", ""))
+            for part in run.split():
+                if part.startswith(".") and len(part) > 1 and part[1].isalpha():
+                    self.fail("hidden path in a run block: %s" % part)
+
+
+class ScopeSlugTests(unittest.TestCase):
+    def test_a_scoped_package_yields_a_slash_free_artifact_name(self):
+        target = rl.Target(pkg="@scope/demo", ver="2.0.0", path=Path("/tmp/x"))
+        self.assertNotIn("/", target.artifact_name)
+        self.assertNotIn("@", target.artifact_name)
+        self.assertEqual(target.artifact_name, "scope-demo-2.0.0-riscv64")
+
+
 class RealRecipeTests(unittest.TestCase):
     """The recipes in this repository carry a hardware step that renders."""
 

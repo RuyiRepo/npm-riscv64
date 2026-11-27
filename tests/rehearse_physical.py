@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         [*overrides, "--root", args.root],
     )
 
-    reports = workspace / ".publish-reports"
+    reports = workspace / "publish-reports"
     plan = workspace / "plan.json"
     plan_args = []
     if reports.is_dir() and any(reports.iterdir()):
