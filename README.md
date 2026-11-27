@@ -1,5 +1,7 @@
 # npm-riscv64
 
+[![build riscv64 packages](https://github.com/RuyiRepo/npm-riscv64/actions/workflows/build.yml/badge.svg)](https://github.com/RuyiRepo/npm-riscv64/actions/workflows/build.yml)
+
 Recipes for building riscv64 binaries of npm packages, plus the CI that turns them
 into published packages.
 
